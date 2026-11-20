@@ -18,6 +18,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "motion-tracker.hpp"
 
+#include "bands.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -248,6 +250,9 @@ void MotionTracker::clear()
 	newest_scan_seq_ = prev_scan_seq_ = 0;
 	any_scan_ = false;
 	rescan_requested_ = false;
+	have_verified_ = false;
+	verified_img_ = Image();
+	unverified_.clear();
 }
 
 bool MotionTracker::take_rescan_request()
@@ -376,10 +381,28 @@ void MotionTracker::measure_strips(const Frame &prev, Frame &cur)
 				return std::numeric_limits<double>::infinity();
 			return trimmed_mean(diffs, 0.7);
 		};
+		// Pass 1: plain mean over all shifts (cheap); pass 2: robust trimmed
+		// score only for the best few candidates (+ zero and the prediction).
+		std::vector<std::pair<double, int>> coarse;
+		for (int sh = pred - radius; sh <= pred + radius; sh++) {
+			double sum = 0;
+			int n = 0;
+			for (int y = std::max(0, sh); y < std::min(H, H + sh); y += 2) {
+				sum += std::fabs(pb[static_cast<size_t>(y)] - pa[static_cast<size_t>(y - sh)]);
+				n++;
+			}
+			if (n * 4 >= H)
+				coarse.emplace_back(sum / n, sh);
+		}
+		const size_t keep = std::min<size_t>(6, coarse.size());
+		std::partial_sort(coarse.begin(), coarse.begin() + static_cast<std::ptrdiff_t>(keep), coarse.end());
+		std::vector<int> cand_shifts = {0, pred};
+		for (size_t i = 0; i < keep; i++)
+			cand_shifts.push_back(coarse[i].second);
 
 		int best = 0;
 		double best_cost = profile_cost(0);
-		for (int sh = pred - radius; sh <= pred + radius; sh++) {
+		for (int sh : cand_shifts) {
 			const double c = profile_cost(sh) + 0.002 * std::abs(sh - pred);
 			if (c < best_cost) {
 				best_cost = c;
@@ -408,6 +431,114 @@ void MotionTracker::measure_strips(const Frame &prev, Frame &cur)
 	}
 }
 
+void MotionTracker::set_anchor(Track &t, const Rect &box, const std::vector<Rect> &anchors, uint64_t seq) const
+{
+	// The old anchor's offset belongs to the old box; never keep it.
+	t.has_anchor = false;
+	t.anchor = Image();
+	const Frame *f = frame_at(seq);
+	if (!f || f->full.empty())
+		return;
+	for (const Rect &a : anchors) {
+		const int cx = a.x + a.w / 2, cy = a.y + a.h / 2;
+		if (cx < box.x || cx >= box.right() || cy < box.y || cy >= box.bottom())
+			continue;
+		const Rect c = a.clipped(static_cast<int>(f->full.width), static_cast<int>(f->full.height));
+		if (c.w < 8 || c.h < 6)
+			continue;
+		t.anchor = crop(f->full, c);
+		t.anchor_dx = c.x - box.x;
+		t.anchor_dy = c.y - box.y;
+		t.has_anchor = true;
+		return;
+	}
+}
+
+bool MotionTracker::hunt_anchor(Track &t, const Rect &cur, const Frame &from, const Frame &to, int pred_dy, Rect &next,
+				int wide) const
+{
+	(void)from;
+	const Image &img = to.full;
+	const Image &tpl = t.anchor;
+	const int ax = cur.x + t.anchor_dx;
+	const int ay = cur.y + t.anchor_dy;
+	const int W = static_cast<int>(img.width), H = static_cast<int>(img.height);
+	const int tw = static_cast<int>(tpl.width), th = static_cast<int>(tpl.height);
+
+	// Motion-shaped window: grow along the predicted motion, shrink behind.
+	// When moving, extend along the motion and cut back behind it. When
+	// (nearly) still, a scroll can start either way: search both ways.
+	int dy0, dy1;
+	if (std::abs(pred_dy) < 3) {
+		dy0 = -wide;
+		dy1 = wide;
+	} else {
+		const int grow = 24 + std::abs(pred_dy);
+		const int shrink = 8;
+		dy0 = pred_dy >= 0 ? -shrink : pred_dy - grow;
+		dy1 = pred_dy >= 0 ? pred_dy + grow : shrink;
+	}
+	const int dx0 = -8, dx1 = 8;
+
+	auto sad = [&](int dx, int dy, int stride) {
+		const int x0 = ax + dx, y0 = ay + dy;
+		if (x0 < 0 || y0 < 0 || x0 + tw > W || y0 + th > H)
+			return std::numeric_limits<double>::infinity();
+		uint64_t sum = 0, n = 0;
+		for (int y = 0; y < th; y += stride) {
+			const uint8_t *rt = tpl.pixels.data() + static_cast<size_t>(y) * tpl.width;
+			const uint8_t *ri = img.pixels.data() + static_cast<size_t>(y0 + y) * img.width + x0;
+			for (int x = 0; x < tw; x += stride) {
+				sum += static_cast<uint64_t>(
+					std::abs(static_cast<int>(rt[x]) - static_cast<int>(ri[x])));
+				n++;
+			}
+		}
+		return n ? static_cast<double>(sum) / static_cast<double>(n) : std::numeric_limits<double>::infinity();
+	};
+
+	// Coarse (every 2nd offset, every 2nd pixel), then refine at full detail.
+	int bx = 0, by = pred_dy;
+	double best = std::numeric_limits<double>::infinity();
+	for (int dy = dy0; dy <= dy1; dy += 2)
+		for (int dx = dx0; dx <= dx1; dx += 2) {
+			const double e = sad(dx, dy, 2);
+			if (e < best) {
+				best = e;
+				bx = dx;
+				by = dy;
+			}
+		}
+	if (std::isinf(best))
+		return false;
+	const int cx = bx, cy = by;
+	best = std::numeric_limits<double>::infinity();
+	for (int dy = cy - 2; dy <= cy + 2; dy++)
+		for (int dx = cx - 2; dx <= cx + 2; dx++) {
+			const double e = sad(dx, dy, 1);
+			if (e < best) {
+				best = e;
+				bx = dx;
+				by = dy;
+			}
+		}
+	// A clean match of the same word stays well below this (anti-aliasing
+	// and video compression only); anything else is "not found".
+	if (best > 14.0) {
+		return false;
+	}
+
+	next = cur;
+	next.x += bx;
+	next.y += by;
+	const double gap = static_cast<double>(to.seq - from.seq);
+	if (gap > 0) {
+		t.st.vx = bx / gap;
+		t.st.vy = by / gap;
+	}
+	return true;
+}
+
 int MotionTracker::strip_of(const Rect &r) const
 {
 	if (frames_.empty())
@@ -432,6 +563,28 @@ bool MotionTracker::step(Track &t, const Frame &from, const Frame &to, bool forw
 	}
 	const int k = strip_of(cur);
 	const int sign = forward ? 1 : -1;
+
+	// Ultra track: find the anchor word again at full resolution, in a
+	// window that extends along the predicted motion and is cut short on
+	// the opposite side. Its displacement is the box's motion.
+	if (forward && t.has_anchor && !from.full.empty() && !to.full.empty()) {
+		// Predict from the anchor's own measured speed; the strip estimate is
+		// only a second place to look (it can be fooled, the anchor less so).
+		const int own = static_cast<int>(std::lround(t.st.vy * static_cast<double>(to.seq - from.seq)));
+		const int strip = later.ok[static_cast<size_t>(k)]
+					  ? static_cast<int>(std::lround(later.shift[static_cast<size_t>(k)] / sy_))
+					  : own;
+		Rect next;
+		// Last resort before falling back to strips: one wide search.
+		if (hunt_anchor(t, cur, from, to, own, next) ||
+		    (strip != own && hunt_anchor(t, cur, from, to, strip, next)) ||
+		    hunt_anchor(t, cur, from, to, 0, next, 160)) {
+			t.st.positions[to.seq] = next;
+			anchor_hits_++;
+			return true;
+		}
+		anchor_misses_++;
+	}
 
 	// Candidates: this strip's motion, its neighbours' (a box can straddle
 	// strips) and zero (fixed content inside a scrolling strip).
@@ -500,7 +653,34 @@ void MotionTracker::propagate_backward(Track &t, uint64_t from_seq, uint64_t to_
 	}
 }
 
-void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t full_w, uint32_t full_h)
+void MotionTracker::add_frame_full(uint64_t seq, uint64_t ts, Image grey_full)
+{
+	if (grey_full.empty() || grey_full.channels != 1)
+		return;
+	const uint32_t fw = grey_full.width, fh = grey_full.height;
+	// Strip thumbnail: halve (2x2 average) until at most ~1000 px wide.
+	// Cheap compared to a generic resample, which matters at 30-60 fps.
+	Image thumb = grey_full;
+	while (thumb.width > 1000 && thumb.height >= 2) {
+		Image h;
+		h.width = thumb.width / 2;
+		h.height = thumb.height / 2;
+		h.channels = 1;
+		h.pixels.resize(static_cast<size_t>(h.width) * h.height);
+		for (uint32_t y = 0; y < h.height; y++) {
+			const uint8_t *r0 = thumb.pixels.data() + static_cast<size_t>(2 * y) * thumb.width;
+			const uint8_t *r1 = r0 + thumb.width;
+			uint8_t *o = h.pixels.data() + static_cast<size_t>(y) * h.width;
+			for (uint32_t x = 0; x < h.width; x++)
+				o[x] = static_cast<uint8_t>(
+					(r0[2 * x] + r0[2 * x + 1] + r1[2 * x] + r1[2 * x + 1] + 2) >> 2);
+		}
+		thumb = std::move(h);
+	}
+	add_frame(seq, ts, std::move(thumb), fw, fh, std::move(grey_full));
+}
+
+void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t full_w, uint32_t full_h, Image full)
 {
 	if (grey.empty() || grey.channels != 1 || full_w == 0 || full_h == 0)
 		return;
@@ -516,10 +696,25 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 	if (!frames_.empty() && seq <= frames_.back().seq)
 		return; // out of order, ignore
 
-	Frame f{seq, ts, std::move(grey), {}, {}};
+	Frame f{seq, ts, std::move(grey), {}, {}, std::move(full)};
 	if (!frames_.empty())
 		measure_strips(frames_.back(), f);
 	frames_.push_back(std::move(f));
+	if (have_verified_) {
+		const Frame &nf = frames_.back();
+		for (size_t k = 0; k < nf.shift.size() && k < cum_shift_.size(); k++)
+			if (nf.ok[k])
+				cum_shift_[k] += nf.shift[k];
+		update_unverified(nf);
+	}
+	// Full-resolution copies are only needed for recent frames (anchor
+	// hunting and re-anchoring late scans); free older ones.
+	constexpr size_t kKeepFull = 48;
+	if (frames_.size() > kKeepFull) {
+		Image &old = frames_[frames_.size() - 1 - kKeepFull].full;
+		if (!old.pixels.empty())
+			old = Image();
+	}
 	const Frame &cur = frames_.back();
 	const Frame *prev = frames_.size() > 1 ? &frames_[frames_.size() - 2] : nullptr;
 
@@ -551,9 +746,9 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 	prune();
 }
 
-void MotionTracker::add_scan(uint64_t seq, std::vector<Rect> rects)
+void MotionTracker::add_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> anchors)
 {
-	Scan sc{seq, std::move(rects), {}, false};
+	Scan sc{seq, std::move(rects), {}, false, std::move(anchors)};
 	if (frames_.empty() || seq > frames_.back().seq) {
 		pending_scans_.push_back(std::move(sc));
 		return;
@@ -561,9 +756,10 @@ void MotionTracker::add_scan(uint64_t seq, std::vector<Rect> rects)
 	apply_scan(std::move(sc));
 }
 
-void MotionTracker::add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions)
+void MotionTracker::add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions,
+				     std::vector<Rect> anchors)
 {
-	Scan sc{seq, std::move(rects), std::move(regions), true};
+	Scan sc{seq, std::move(rects), std::move(regions), true, std::move(anchors)};
 	if (frames_.empty() || seq > frames_.back().seq) {
 		pending_scans_.push_back(std::move(sc));
 		return;
@@ -643,10 +839,12 @@ void MotionTracker::apply_scan(Scan scan)
 			for (auto it = t.st.positions.upper_bound(seq); it != t.st.positions.end();)
 				it = t.st.positions.erase(it);
 			t.st.positions[seq] = d;
+			set_anchor(t, d, scan.anchors, seq);
 			propagate_forward(t, seq);
 		} else {
 			Track t;
 			t.st.positions[seq] = d;
+			set_anchor(t, d, scan.anchors, seq);
 			uint64_t back_to = prev_scan_seq_;
 			const uint64_t newest = frames_.empty() ? seq : frames_.back().seq;
 			if (config_.lookback_frames && newest > config_.lookback_frames)
@@ -659,6 +857,9 @@ void MotionTracker::apply_scan(Scan scan)
 			matched_track.push_back(true);
 		}
 	}
+
+	if (!scan.partial)
+		set_verified(seq);
 
 	// Tracks this scan should have seen but did not.
 	for (size_t i = 0; i < matched_track.size() && i < tracks_.size(); i++) {
@@ -721,9 +922,78 @@ double MotionTracker::max_speed() const
 	return m;
 }
 
+void MotionTracker::set_verified(uint64_t seq)
+{
+	const Frame *f = frame_at(seq);
+	if (!f)
+		return;
+	verified_img_ = f->grey;
+	cum_shift_.assign(kStrips, 0);
+	// Motion since the scanned frame (frames already processed).
+	for (const Frame &later : frames_) {
+		if (later.seq <= seq)
+			continue;
+		for (size_t k = 0; k < later.shift.size() && k < cum_shift_.size(); k++)
+			if (later.ok[k])
+				cum_shift_[k] += later.shift[k];
+	}
+	have_verified_ = true;
+	if (!frames_.empty())
+		update_unverified(frames_.back());
+}
+
+void MotionTracker::update_unverified(const Frame &f)
+{
+	unverified_.clear();
+	const Image &cur = f.grey;
+	const Image &ref = verified_img_;
+	if (cur.width != ref.width || cur.height != ref.height || cur.empty())
+		return;
+	const int W = static_cast<int>(cur.width), H = static_cast<int>(cur.height);
+	constexpr int kCell = 16;
+	for (int cy = 0; cy < H; cy += kCell) {
+		int run_start = -1;
+		for (int cx = 0; cx <= W; cx += kCell) {
+			bool dirty = false;
+			if (cx < W) {
+				const int k = std::clamp(cx * kStrips / W, 0, kStrips - 1);
+				const int sh = cum_shift_.empty() ? 0 : cum_shift_[static_cast<size_t>(k)];
+				uint64_t sum = 0, n = 0;
+				for (int y = cy; y < std::min(H, cy + kCell) && !dirty; y += 2) {
+					const int py = y - sh;
+					if (py < 0 || py >= H) {
+						dirty = true; // content that scrolled in since the scan
+						break;
+					}
+					const uint8_t *rc = cur.pixels.data() + static_cast<size_t>(y) * cur.width;
+					const uint8_t *rr = ref.pixels.data() + static_cast<size_t>(py) * ref.width;
+					for (int x = cx; x < std::min(W, cx + kCell); x += 2) {
+						sum += static_cast<uint64_t>(
+							std::abs(static_cast<int>(rc[x]) - static_cast<int>(rr[x])));
+						n++;
+					}
+				}
+				if (!dirty && n && static_cast<double>(sum) / static_cast<double>(n) > 6.0)
+					dirty = true; // content changed since the scan
+			}
+			if (dirty && run_start < 0)
+				run_start = cx;
+			if (!dirty && run_start >= 0) {
+				// Cell run [run_start, cx) on this row -> full resolution.
+				const Rect thumb{run_start, cy, cx - run_start, std::min(kCell, H - cy)};
+				unverified_.push_back(thumb.scaled(1.0 / sx_, 1.0 / sy_));
+				run_start = -1;
+			}
+		}
+	}
+	unverified_ = merge_rects(std::move(unverified_));
+}
+
 TrackerView MotionTracker::view(uint64_t from_seq) const
 {
 	TrackerView v;
+	v.verified_any = have_verified_;
+	v.unverified = unverified_;
 	v.newest_scan_seq = newest_scan_seq_;
 	v.any_scan = any_scan_;
 	v.persist_ns = config_.persist_ns;
@@ -733,7 +1003,9 @@ TrackerView MotionTracker::view(uint64_t from_seq) const
 		// Boxes extrapolate with their strip's (smoothed) scroll speed.
 		s.vx = 0.0;
 		s.vy = 0.0;
-		if (!t.st.positions.empty() && strip_vy_.size() == kStrips)
+		if (t.has_anchor)
+			s.vy = t.st.vy; // measured from the anchor word itself
+		else if (!t.st.positions.empty() && strip_vy_.size() == kStrips)
 			s.vy = strip_vy_[static_cast<size_t>(strip_of(t.st.positions.rbegin()->second))];
 		s.dead = t.st.dead;
 		s.dead_ts = t.st.dead_ts;

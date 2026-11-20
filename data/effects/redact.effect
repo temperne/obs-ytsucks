@@ -60,6 +60,23 @@ float4 PSBlur(VertData v_in) : TARGET
 	return sum / 81.0;
 }
 
+// Full-resolution luma for motion tracking (read back as GS_R8).
+float4 PSLuma(VertData v_in) : TARGET
+{
+	float3 c = image.Sample(pointSampler, v_in.uv).rgb;
+	float l = dot(c, float3(0.299, 0.587, 0.114));
+	return float4(l, l, l, 1.0);
+}
+
+technique Luma
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSLuma(v_in);
+	}
+}
+
 technique Pixelate
 {
 	pass

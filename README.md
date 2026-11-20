@@ -54,6 +54,21 @@ or display capture), or to a nested scene to protect everything inside it.
 
 * **Redaction style.** *Solid box* is the default and the only safe choice.
   Pixelation and blur of short text such as numbers can sometimes be reversed.
+* **Paranoid mode (on by default).**
+  * *Keep everything covered until it has been checked:* the screen starts
+    covered by a "Protecting Personal Information" image. The cover
+    shrinks as full scans verify the screen. Anything that changes or
+    scrolls into view is covered again until it has been read, while
+    content that only scrolled stays visible.
+  * *Cover image:* replace the built-in image with your own picture.
+  * *Also cover the lines above and below detected PII:* a contact block
+    stays hidden even if OCR misreads the address next to the phone number
+    it did catch.
+* **Tracking.** Each detected item gets an anchor: its clearest,
+  highest-confidence word, kept as a full-resolution image. Every frame,
+  that word is found again in a search window stretched in the direction
+  of motion, and the box moves with it. Between full scans, targeted scans
+  re-read the area around each known box at full resolution.
 * **Box lifetime.** Once something is detected, its box stays up until
   scans confirm the text is gone: two scans in a row must not see it, so
   one OCR miss can't uncover it. *Extra time to keep a box* adds a margin

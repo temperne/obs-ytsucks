@@ -48,6 +48,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "ocr/ocr-pool.hpp"
 
 #include <obs-module.h>
+#include <graphics/image-file.h>
+#include <graphics/matrix4.h>
 #include <graphics/vec2.h>
 #include <graphics/vec4.h>
 #include <util/platform.h>
@@ -56,6 +58,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -104,10 +107,12 @@ constexpr const char *S_DELAY = "delay_frames";
 constexpr const char *S_FAILSAFE = "fail_safe";
 constexpr const char *S_DEBUG = "debug_outlines";
 constexpr const char *S_EDGE = "edge_guard";
+constexpr const char *S_COVER = "privacy_cover";
+constexpr const char *S_COVER_IMAGE = "cover_image";
+constexpr const char *S_NEIGHBORS = "cover_neighbors";
 constexpr const char *S_STATUS = "status";
 
 constexpr int kMaxDelayFrames = 120;
-constexpr uint32_t kThumbWidth = 768;
 // Motion sampling: every Nth frame while static, every Mth while moving.
 constexpr uint64_t kSampleEveryStatic = 1;
 constexpr uint64_t kSampleEveryMoving = 1;
@@ -164,6 +169,42 @@ std::vector<std::string> split_lines(const char *text)
 	return out;
 }
 
+// Paranoid: also cover the lines right above and below a detection (and a
+// bit further right), so a contact block is hidden even when OCR misreads
+// the address next to the phone number it did catch.
+Rect with_neighbors(const Rect &line)
+{
+	const int lh = std::max(8, line.h);
+	const int up = lh * 3 / 2;
+	return Rect{line.x - lh, line.y - up, line.w + line.w / 2 + lh, line.h + 2 * up};
+}
+
+// The best "ultra track" word inside a detection: highest OCR confidence,
+// at least 4 alphanumeric characters. Coordinates as the OCR words.
+bool pick_anchor(const std::vector<OcrLine> &lines, const Rect &det, Rect &out)
+{
+	float best = -1.0f;
+	for (const OcrLine &l : lines) {
+		for (const OcrWord &w : l.words) {
+			const int cx = w.box.x + w.box.w / 2, cy = w.box.y + w.box.h / 2;
+			if (cx < det.x || cx >= det.right() || cy < det.y || cy >= det.bottom())
+				continue;
+			const size_t alnum =
+				static_cast<size_t>(std::count_if(w.text.begin(), w.text.end(), [](char c) {
+					return std::isalnum(static_cast<unsigned char>(c));
+				}));
+			if (alnum < 4)
+				continue;
+			const float score = w.confidence + static_cast<float>(alnum);
+			if (score > best) {
+				best = score;
+				out = w.box;
+			}
+		}
+	}
+	return best >= 0.0f;
+}
+
 std::string bundled_tessdata_path()
 {
 	char *path = obs_module_file("tessdata");
@@ -181,6 +222,7 @@ struct RenderSettings {
 	bool fail_safe = false;
 	bool debug = false;
 	bool edge_guard = true;
+	bool cover = true;
 	uint64_t interval_ns = 250000000ULL;
 };
 
@@ -190,6 +232,7 @@ struct AnalysisSettings {
 	OcrConfig ocr;
 	double scale = 1.0;
 	int padding = 6;
+	bool neighbors = true;
 	size_t threads = 1;
 };
 
@@ -197,11 +240,12 @@ struct MotionEvent {
 	enum class Kind { Frame, Scan } kind = Kind::Frame;
 	uint64_t seq = 0;
 	uint64_t ts = 0;
-	Image thumb; // BGRA (Frame)
+	Image thumb; // full-resolution grey (Frame)
 	uint32_t full_w = 0;
 	uint32_t full_h = 0;
 	std::vector<Rect> rects;   // (Scan)
 	std::vector<Rect> regions; // (Scan) targeted scan: the areas that were read
+	std::vector<Rect> anchors; // (Scan) anchor words, full resolution
 	bool partial = false;
 };
 
@@ -254,11 +298,17 @@ private:
 
 	obs_source_t *context_;
 	gs_effect_t *redact_effect_ = nullptr;
+	// Image shown on the privacy cover ("Protecting Personal Information").
+	gs_image_file_t cover_image_ = {};
+	bool cover_image_loaded_ = false;
+	std::string cover_image_path_;
+	void load_cover_image(const std::string &path);
+	void draw_cover(const std::vector<Rect> &rects, uint32_t width, uint32_t height, bool full);
 
 	// Render-thread state (graphics context only).
 	std::vector<Slot> ring_;
 	size_t write_idx_ = 0;
-	uint64_t frame_seq_ = 0;
+	std::atomic<uint64_t> frame_seq_{0};
 	uint32_t width_ = 0;
 	uint32_t height_ = 0;
 	gs_stagesurf_t *stage_ = nullptr;
@@ -360,6 +410,8 @@ PiiRedactFilter::~PiiRedactFilter()
 		motion_thread_.join();
 
 	obs_enter_graphics();
+	if (cover_image_loaded_)
+		gs_image_file_free(&cover_image_);
 	free_graphics();
 	if (redact_effect_)
 		gs_effect_destroy(redact_effect_);
@@ -376,6 +428,16 @@ void PiiRedactFilter::update(obs_data_t *settings)
 	rs.fail_safe = obs_data_get_bool(settings, S_FAILSAFE);
 	rs.debug = obs_data_get_bool(settings, S_DEBUG);
 	rs.edge_guard = obs_data_get_bool(settings, S_EDGE);
+	rs.cover = obs_data_get_bool(settings, S_COVER);
+	{
+		std::string img = obs_data_get_string(settings, S_COVER_IMAGE);
+		if (img.empty()) {
+			char *def = obs_module_file("protecting.png");
+			img = def ? def : "";
+			bfree(def);
+		}
+		load_cover_image(img);
+	}
 	rs.interval_ns =
 		static_cast<uint64_t>(std::max<long long>(0, obs_data_get_int(settings, S_INTERVAL))) * 1000000ULL;
 
@@ -399,6 +461,7 @@ void PiiRedactFilter::update(obs_data_t *settings)
 	as.ocr.fast_mode = obs_data_get_bool(settings, S_FAST);
 	as.scale = std::clamp(obs_data_get_double(settings, S_SCALE), 0.25, 3.0);
 	as.padding = static_cast<int>(obs_data_get_int(settings, S_PADDING));
+	as.neighbors = obs_data_get_bool(settings, S_NEIGHBORS);
 	const long long threads = obs_data_get_int(settings, S_THREADS);
 	as.threads = threads <= 0 ? auto_threads() : static_cast<size_t>(std::min<long long>(threads, 32));
 
@@ -550,6 +613,7 @@ void PiiRedactFilter::worker_main()
 				const std::vector<std::vector<OcrLine>> rres = pool->run(rtasks);
 
 				std::vector<Rect> found;
+				std::vector<Rect> tanchors;
 				size_t twords = 0;
 				for (size_t k = 0; k < rres.size(); k++) {
 					std::vector<OcrLine> lines = rres[k];
@@ -561,12 +625,16 @@ void PiiRedactFilter::worker_main()
 						twords += l.words.size();
 					}
 					for (const Detection &d : matcher->match(lines)) {
-						const Rect r = d.box.scaled(back_x, back_y)
+						const Rect r = (as.neighbors ? with_neighbors(d.box) : d.box)
+								       .scaled(back_x, back_y)
 								       .padded(as.padding)
 								       .clipped(static_cast<int>(src_w),
 										static_cast<int>(src_h));
 						if (!r.empty())
 							found.push_back(r);
+						Rect a;
+						if (pick_anchor(lines, d.box, a))
+							tanchors.push_back(a.scaled(back_x, back_y));
 					}
 				}
 				const size_t nfound = found.size();
@@ -582,6 +650,7 @@ void PiiRedactFilter::worker_main()
 				pev.ts = job.ts;
 				pev.rects = std::move(found);
 				pev.regions = regions;
+				pev.anchors = std::move(tanchors);
 				post_motion(std::move(pev));
 
 				const double ms =
@@ -719,6 +788,7 @@ void PiiRedactFilter::worker_main()
 		const std::vector<std::vector<OcrLine>> results = pool->run(todo);
 
 		size_t words = 0;
+		std::vector<Rect> anchors_img;
 		for (size_t k = 0; k < results.size(); k++) {
 			std::vector<OcrLine> lines = results[k];
 			for (OcrLine &l : lines) {
@@ -728,8 +798,12 @@ void PiiRedactFilter::worker_main()
 				}
 				words += l.words.size();
 			}
-			for (const Detection &d : matcher->match(lines))
-				dets.push_back(d.box);
+			for (const Detection &d : matcher->match(lines)) {
+				dets.push_back(as.neighbors ? with_neighbors(d.box) : d.box);
+				Rect a;
+				if (pick_anchor(lines, d.box, a))
+					anchors_img.push_back(a);
+			}
 		}
 		dets = merge_rects(std::move(dets));
 		{
@@ -783,6 +857,8 @@ void PiiRedactFilter::worker_main()
 		ev.seq = job.seq;
 		ev.ts = job.ts;
 		ev.rects = std::move(rects);
+		for (const Rect &a : anchors_img)
+			ev.anchors.push_back(a.scaled(back_x, back_y));
 		post_motion(std::move(ev));
 
 		const double ms =
@@ -858,7 +934,7 @@ void PiiRedactFilter::motion_main()
 
 		for (MotionEvent &ev : batch) {
 			if (ev.kind == MotionEvent::Kind::Frame) {
-				tracker.add_frame(ev.seq, ev.ts, to_grey(ev.thumb), ev.full_w, ev.full_h);
+				tracker.add_frame_full(ev.seq, ev.ts, std::move(ev.thumb));
 				if (ev.seq > last_seq && last_seq) {
 					// Video frames per second from the sample timestamps.
 					const double dt = static_cast<double>(ev.ts - last_ts) / 1e9;
@@ -870,14 +946,30 @@ void PiiRedactFilter::motion_main()
 				last_seq = ev.seq;
 			} else {
 				if (ev.partial)
-					tracker.add_partial_scan(ev.seq, std::move(ev.rects), std::move(ev.regions));
+					tracker.add_partial_scan(ev.seq, std::move(ev.rects), std::move(ev.regions),
+								 std::move(ev.anchors));
 				else
-					tracker.add_scan(ev.seq, std::move(ev.rects));
+					tracker.add_scan(ev.seq, std::move(ev.rects), std::move(ev.anchors));
 			}
 		}
 
 		if (tracker.take_rescan_request())
 			force_scan_ = true;
+		static const bool mdebug = getenv("OBS_PII_DEBUG") != nullptr;
+		if (mdebug && !batch.empty()) {
+			static uint64_t last_log = 0;
+			const uint64_t now = os_gettime_ns();
+			if (now - last_log > 500000000ULL) {
+				last_log = now;
+				obs_log(LOG_INFO,
+					"motion: newest frame %llu (captured %llu), %zu tracks (%zu anchored), anchor hits %llu misses %llu",
+					static_cast<unsigned long long>(tracker.newest_frame_seq()),
+					static_cast<unsigned long long>(frame_seq_.load()), tracker.track_count(),
+					tracker.anchored_tracks(),
+					static_cast<unsigned long long>(tracker.anchor_hits()),
+					static_cast<unsigned long long>(tracker.anchor_misses()));
+			}
+		}
 		moving_ = tracker.max_speed() > 0.5;
 		track_count_ = tracker.track_count();
 
@@ -926,17 +1018,19 @@ void PiiRedactFilter::reset_ring(uint32_t width, uint32_t height, size_t slots)
 	height_ = height;
 	write_idx_ = 0;
 
-	thumb_w_ = std::min(kThumbWidth, width);
-	thumb_h_ = std::max<uint32_t>(1, static_cast<uint32_t>(static_cast<uint64_t>(height) * thumb_w_ / width));
-	thumb_tr_ = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	// Full-resolution luma (1 byte/pixel): the motion thread derives its
+	// strip thumbnails from it and hunts anchors in it at full detail.
+	thumb_w_ = width;
+	thumb_h_ = height;
+	thumb_tr_ = gs_texrender_create(GS_R8, GS_ZS_NONE);
 	for (size_t i = 0; i < kThumbStages; i++)
-		thumb_stage_[i] = gs_stagesurface_create(thumb_w_, thumb_h_, GS_BGRA);
+		thumb_stage_[i] = gs_stagesurface_create(thumb_w_, thumb_h_, GS_R8);
 	last_sample_seq_ = 0;
 }
 
 void PiiRedactFilter::sample_motion(const Slot &slot, bool force)
 {
-	if (!thumb_tr_)
+	if (!thumb_tr_ || !redact_effect_)
 		return;
 
 	// Hand over thumbnails staged on earlier frames (never the one staged
@@ -951,7 +1045,7 @@ void PiiRedactFilter::sample_motion(const Slot &slot, bool force)
 			ev.kind = MotionEvent::Kind::Frame;
 			ev.seq = thumb_seq_[i];
 			ev.ts = thumb_ts_[i];
-			ev.thumb = image_from_bgra(data, thumb_w_, thumb_h_, linesize);
+			ev.thumb = image_from_grey(data, thumb_w_, thumb_h_, linesize);
 			ev.full_w = width_;
 			ev.full_h = height_;
 			gs_stagesurface_unmap(thumb_stage_[i]);
@@ -976,9 +1070,8 @@ void PiiRedactFilter::sample_motion(const Slot &slot, bool force)
 	gs_ortho(0.0f, static_cast<float>(width_), 0.0f, static_cast<float>(height_), -100.0f, 100.0f);
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
-	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
-	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), tex);
-	while (gs_effect_loop(effect, "Draw"))
+	gs_effect_set_texture(gs_effect_get_param_by_name(redact_effect_, "image"), tex);
+	while (gs_effect_loop(redact_effect_, "Luma"))
 		gs_draw_sprite(tex, 0, width_, height_);
 	gs_blend_state_pop();
 	gs_texrender_end(thumb_tr_);
@@ -1259,6 +1352,67 @@ void PiiRedactFilter::render()
 		draw_solid(regions, rs.color);
 	else
 		draw_filtered(tex, regions, rs, width, height);
+
+	// Fail-closed privacy cover: everything not yet read by a full scan stays
+	// covered. Starts as a full-screen cover and collapses as scans verify
+	// the screen; changed or newly scrolled-in content is covered again.
+	if (rs.cover && !rs.debug) {
+		std::vector<Rect> cover;
+		long long area = 0;
+		if (view && view->verified_any) {
+			for (const Rect &r : view->unverified) {
+				const Rect c = r.clipped(static_cast<int>(width), static_cast<int>(height));
+				if (!c.empty()) {
+					cover.push_back(c);
+					area += static_cast<long long>(c.w) * c.h;
+				}
+			}
+		}
+		const long long total = static_cast<long long>(width) * height;
+		const bool full = !view || !view->verified_any || area * 100 > total * 85;
+		draw_cover(full ? full_frame : cover, width, height, full);
+	}
+}
+
+void PiiRedactFilter::load_cover_image(const std::string &path)
+{
+	if (path == cover_image_path_)
+		return;
+	cover_image_path_ = path;
+	obs_enter_graphics();
+	if (cover_image_loaded_)
+		gs_image_file_free(&cover_image_);
+	cover_image_loaded_ = false;
+	obs_leave_graphics();
+	if (path.empty())
+		return;
+	gs_image_file_init(&cover_image_, path.c_str());
+	obs_enter_graphics();
+	gs_image_file_init_texture(&cover_image_);
+	obs_leave_graphics();
+	cover_image_loaded_ = cover_image_.texture != nullptr;
+	if (!cover_image_loaded_)
+		obs_log(LOG_WARNING, "could not load cover image %s", path.c_str());
+}
+
+void PiiRedactFilter::draw_cover(const std::vector<Rect> &rects, uint32_t width, uint32_t height, bool full)
+{
+	draw_solid(rects, 0xFF000000);
+	if (!full || !cover_image_loaded_ || !cover_image_.texture)
+		return;
+	// Image centred, at most 70% of the frame width.
+	const float iw = static_cast<float>(cover_image_.cx), ih = static_cast<float>(cover_image_.cy);
+	if (iw <= 0 || ih <= 0)
+		return;
+	const float scale = std::min(0.7f * static_cast<float>(width) / iw, 0.7f * static_cast<float>(height) / ih);
+	const float dw = iw * scale, dh = ih * scale;
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), cover_image_.texture);
+	gs_matrix_push();
+	gs_matrix_translate3f((static_cast<float>(width) - dw) / 2.0f, (static_cast<float>(height) - dh) / 2.0f, 0.0f);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(cover_image_.texture, 0, static_cast<uint32_t>(dw), static_cast<uint32_t>(dh));
+	gs_matrix_pop();
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,6 +1510,10 @@ obs_properties_t *PiiRedactFilter::properties()
 	obs_properties_t *safety = obs_properties_create();
 	p = obs_properties_add_int(safety, S_DELAY, obs_module_text("PIIRedact.DelayFrames"), 0, kMaxDelayFrames, 1);
 	obs_property_set_long_description(p, obs_module_text("PIIRedact.DelayFrames.Description"));
+	obs_properties_add_bool(safety, S_COVER, obs_module_text("PIIRedact.Cover"));
+	obs_properties_add_path(safety, S_COVER_IMAGE, obs_module_text("PIIRedact.CoverImage"), OBS_PATH_FILE,
+				"Images (*.png *.jpg *.jpeg *.bmp *.gif *.webp)", nullptr);
+	obs_properties_add_bool(safety, S_NEIGHBORS, obs_module_text("PIIRedact.Neighbors"));
 	obs_properties_add_bool(safety, S_EDGE, obs_module_text("PIIRedact.EdgeGuard"));
 	obs_properties_add_bool(safety, S_FAILSAFE, obs_module_text("PIIRedact.FailSafe"));
 	obs_properties_add_bool(safety, S_DEBUG, obs_module_text("PIIRedact.Debug"));
@@ -1443,6 +1601,9 @@ void filter_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, S_FAILSAFE, false);
 	obs_data_set_default_bool(settings, S_DEBUG, false);
 	obs_data_set_default_bool(settings, S_EDGE, true);
+	obs_data_set_default_bool(settings, S_COVER, true);
+	obs_data_set_default_string(settings, S_COVER_IMAGE, "");
+	obs_data_set_default_bool(settings, S_NEIGHBORS, true);
 }
 
 } // namespace

@@ -37,6 +37,9 @@ struct Image {
 // Copy a (possibly padded) BGRA buffer into a packed Image.
 Image image_from_bgra(const uint8_t *data, uint32_t width, uint32_t height, uint32_t linesize);
 
+// Copy a (possibly padded) 8-bit single-channel buffer into a packed Image.
+Image image_from_grey(const uint8_t *data, uint32_t width, uint32_t height, uint32_t linesize);
+
 // Area-average resample to the given size (any channel count).
 Image resize(const Image &src, uint32_t width, uint32_t height);
 

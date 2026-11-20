@@ -36,6 +36,19 @@ Image image_from_bgra(const uint8_t *data, uint32_t width, uint32_t height, uint
 	return img;
 }
 
+Image image_from_grey(const uint8_t *data, uint32_t width, uint32_t height, uint32_t linesize)
+{
+	Image img;
+	img.width = width;
+	img.height = height;
+	img.channels = 1;
+	img.pixels.resize(static_cast<size_t>(width) * height);
+	for (uint32_t y = 0; y < height; y++)
+		std::memcpy(img.pixels.data() + static_cast<size_t>(y) * width,
+			    data + static_cast<size_t>(y) * linesize, width);
+	return img;
+}
+
 Image resize(const Image &src, uint32_t width, uint32_t height)
 {
 	if (src.empty() || width == 0 || height == 0)

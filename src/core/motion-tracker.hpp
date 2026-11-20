@@ -95,6 +95,12 @@ struct TrackerView {
 	uint64_t newest_scan_seq = 0;
 	bool any_scan = false;
 	uint64_t persist_ns = 0;
+	// Fail-closed cover: areas (full resolution) of the newest frame whose
+	// content has not been read by a full scan (new or changed content;
+	// content that only scrolled stays verified). `verified_any` is false
+	// until the first full scan, i.e. nothing has been verified yet.
+	bool verified_any = false;
+	std::vector<Rect> unverified;
 
 	// Boxes for the frame `seq` captured at `ts`. Frames newer than the
 	// tracker has seen are extrapolated with each box's velocity (and the
@@ -112,15 +118,23 @@ public:
 
 	// Add the thumbnail (1 channel) of captured frame `seq`. `full_w/h` is
 	// the source resolution the boxes are expressed in.
-	void add_frame(uint64_t seq, uint64_t ts, Image grey_thumb, uint32_t full_w, uint32_t full_h);
+	void add_frame(uint64_t seq, uint64_t ts, Image grey_thumb, uint32_t full_w, uint32_t full_h,
+		       Image grey_full = Image());
+	// Full-resolution grey frame: the strip thumbnail is derived from it and
+	// it is kept (recent frames only) for anchor tracking.
+	void add_frame_full(uint64_t seq, uint64_t ts, Image grey_full);
 
 	// OCR found `rects` (full resolution) in frame `seq`. May arrive before
 	// that frame's thumbnail; it is then applied when the thumbnail comes.
-	void add_scan(uint64_t seq, std::vector<Rect> rects);
+	// `anchors`: high-confidence OCR words (full resolution) inside the
+	// detections; each box is then tracked by finding its anchor word again
+	// in every frame at full resolution.
+	void add_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> anchors = {});
 	// Targeted scan: only `regions` (full resolution) of frame `seq` were
 	// read. Boxes inside them are re-anchored (or counted as missed); boxes
 	// elsewhere are left alone, and it does not count as a full scan.
-	void add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions);
+	void add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions,
+			      std::vector<Rect> anchors = {});
 
 	// Snapshot holding positions for frames >= from_seq.
 	TrackerView view(uint64_t from_seq) const;
@@ -129,6 +143,15 @@ public:
 	bool take_rescan_request();
 
 	size_t track_count() const { return tracks_.size(); }
+	uint64_t anchor_hits() const { return anchor_hits_; }
+	uint64_t anchor_misses() const { return anchor_misses_; }
+	size_t anchored_tracks() const
+	{
+		size_t n = 0;
+		for (const Track &t : tracks_)
+			n += t.has_anchor ? 1 : 0;
+		return n;
+	}
 	// Fastest box motion (full-res pixels per video frame) among live tracks.
 	double max_speed() const;
 	uint64_t newest_frame_seq() const { return frames_.empty() ? 0 : frames_.back().seq; }
@@ -144,16 +167,24 @@ private:
 		// whether that strip's motion could be confirmed.
 		std::vector<int> shift;
 		std::vector<uint8_t> ok;
+		Image full; // full-resolution grey, kept for the most recent frames
 	};
 	struct Track {
 		TrackState st;
 		size_t misses = 0;
+		// "Ultra track": an exact full-resolution image of one high-confidence
+		// word of the PII, and its offset from the box's top-left corner.
+		bool has_anchor = false;
+		int anchor_dx = 0;
+		int anchor_dy = 0;
+		Image anchor;
 	};
 	struct Scan {
 		uint64_t seq;
 		std::vector<Rect> rects;
 		std::vector<Rect> regions; // non-empty for targeted scans
 		bool partial = false;
+		std::vector<Rect> anchors;
 	};
 
 	const Frame *frame_at(uint64_t seq) const;
@@ -162,6 +193,9 @@ private:
 	// direction). Returns false when the content was lost.
 	bool step(Track &t, const Frame &from, const Frame &to, bool forward);
 	void measure_strips(const Frame &prev, Frame &cur);
+	bool hunt_anchor(Track &t, const Rect &cur, const Frame &from, const Frame &to, int pred_dy, Rect &next,
+			 int wide = 40) const;
+	void set_anchor(Track &t, const Rect &box, const std::vector<Rect> &anchors, uint64_t seq) const;
 	int strip_of(const Rect &full_rect) const;
 	void propagate_forward(Track &t, uint64_t from_seq);
 	void propagate_backward(Track &t, uint64_t from_seq, uint64_t to_seq);
@@ -181,9 +215,18 @@ private:
 	uint64_t prev_scan_seq_ = 0;
 	bool any_scan_ = false;
 	uint64_t newest_partial_seq_ = 0;
+	uint64_t anchor_hits_ = 0;
+	uint64_t anchor_misses_ = 0;
 	bool rescan_requested_ = false;
 	// Smoothed vertical velocity per strip, full-res px per video frame.
 	std::vector<double> strip_vy_;
+	// Verification map (see TrackerView::unverified).
+	Image verified_img_;
+	std::vector<int> cum_shift_;
+	bool have_verified_ = false;
+	std::vector<Rect> unverified_;
+	void set_verified(uint64_t seq);
+	void update_unverified(const Frame &f);
 };
 
 // Block matching, exposed for tests. Finds (dx, dy) minimising the mean
