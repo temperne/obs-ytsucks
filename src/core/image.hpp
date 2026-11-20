@@ -43,4 +43,9 @@ Image resize(const Image &src, uint32_t width, uint32_t height);
 // BGRA -> 8-bit luma (BT.601).
 Image to_grey(const Image &bgra);
 
+// Make all text dark-on-light: every `tile` x `tile` block whose mean is
+// dark (a dark-mode window, a terminal...) is inverted in place. Lets OCR
+// skip its own "try the line inverted too" pass, which costs ~30-40%.
+void normalize_polarity(Image &grey, int tile = 48);
+
 } // namespace pii

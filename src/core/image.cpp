@@ -94,4 +94,32 @@ Image to_grey(const Image &bgra)
 	return g;
 }
 
+void normalize_polarity(Image &grey, int tile)
+{
+	if (grey.empty() || grey.channels != 1 || tile <= 0)
+		return;
+	const int w = static_cast<int>(grey.width);
+	const int h = static_cast<int>(grey.height);
+	for (int ty = 0; ty < h; ty += tile) {
+		for (int tx = 0; tx < w; tx += tile) {
+			const int x1 = std::min(w, tx + tile);
+			const int y1 = std::min(h, ty + tile);
+			uint64_t sum = 0;
+			for (int y = ty; y < y1; y++) {
+				const uint8_t *row = grey.pixels.data() + static_cast<size_t>(y) * w;
+				for (int x = tx; x < x1; x++)
+					sum += row[x];
+			}
+			const uint64_t n = static_cast<uint64_t>(x1 - tx) * static_cast<uint64_t>(y1 - ty);
+			if (sum >= n * 110)
+				continue; // light enough: text is presumably dark-on-light
+			for (int y = ty; y < y1; y++) {
+				uint8_t *row = grey.pixels.data() + static_cast<size_t>(y) * w;
+				for (int x = tx; x < x1; x++)
+					row[x] = static_cast<uint8_t>(255 - row[x]);
+			}
+		}
+	}
+}
+
 } // namespace pii

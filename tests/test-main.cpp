@@ -332,6 +332,19 @@ static void test_image()
 	Image half = resize(img, 2, 1);
 	CHECK(half.width == 2 && half.height == 1 && half.pixels[0] == 255);
 
+	{
+		// Dark tile gets inverted, light tile left alone.
+		Image gimg;
+		gimg.width = 8;
+		gimg.height = 4;
+		gimg.channels = 1;
+		gimg.pixels.assign(32, 230);
+		for (int y = 0; y < 4; y++)
+			for (int x = 4; x < 8; x++)
+				gimg.pixels[static_cast<size_t>(y * 8 + x)] = 20;
+		normalize_polarity(gimg, 4);
+		CHECK(gimg.pixels[0] == 230 && gimg.pixels[4] == 235);
+	}
 	std::vector<uint8_t> padded(2 * 16, 7); // linesize 16 for width 2
 	Image packed = image_from_bgra(padded.data(), 2, 2, 16);
 	CHECK(packed.pixels.size() == 16 && packed.pixels[15] == 7);

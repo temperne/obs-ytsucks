@@ -86,6 +86,9 @@ public:
 		// Dictionaries "correct" numbers and addresses away; turn them off.
 		api_.SetVariable("load_system_dawg", "0");
 		api_.SetVariable("load_freq_dawg", "0");
+		// We normalise light-on-dark regions ourselves (normalize_polarity),
+		// so skip Tesseract's per-line "try it inverted" pass.
+		api_.SetVariable("tessedit_do_invert", "0");
 		return true;
 	}
 
@@ -95,7 +98,8 @@ public:
 	{
 		disable_openmp_parallelism();
 		std::vector<OcrLine> lines;
-		const Image grey = to_grey(bgra);
+		Image grey = to_grey(bgra);
+		normalize_polarity(grey);
 		if (grey.empty())
 			return lines;
 

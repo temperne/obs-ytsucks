@@ -59,6 +59,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <fstream>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -111,13 +113,35 @@ constexpr uint64_t kSampleEveryStatic = 6;
 constexpr uint64_t kSampleEveryMoving = 2;
 constexpr size_t kThumbStages = 3;
 
+// Physical CPU cores (hyper-threads don't help OCR much).
+unsigned physical_cores()
+{
+	const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+#ifdef __linux__
+	// Unique (physical id, core id) pairs in /proc/cpuinfo.
+	std::ifstream f("/proc/cpuinfo");
+	std::string line;
+	std::set<std::pair<int, int>> cores;
+	int phys = 0;
+	while (std::getline(f, line)) {
+		if (line.rfind("physical id", 0) == 0)
+			phys = std::atoi(line.c_str() + line.find(':') + 1);
+		else if (line.rfind("core id", 0) == 0)
+			cores.insert({phys, std::atoi(line.c_str() + line.find(':') + 1)});
+	}
+	if (!cores.empty())
+		return static_cast<unsigned>(std::min<size_t>(cores.size(), hw));
+#endif
+	// Elsewhere assume 2 threads per core on machines with 8+ threads.
+	return hw >= 8 ? hw / 2 : hw;
+}
+
 size_t auto_threads()
 {
-	const unsigned hw = std::thread::hardware_concurrency();
-	if (hw <= 2)
-		return 1;
-	// Leave room for OBS itself and the encoder.
-	return std::min<size_t>(8, static_cast<size_t>(hw) * 3 / 4);
+	// Physical cores minus one (for OBS and the encoder): 3 on a
+	// 4-core/8-thread laptop.
+	const unsigned cores = physical_cores();
+	return std::clamp<size_t>(cores > 1 ? cores - 1 : 1, 1, 8);
 }
 
 enum class Style : int { Box = 0, Pixelate = 1, Blur = 2 };
