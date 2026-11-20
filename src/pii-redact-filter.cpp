@@ -27,15 +27,25 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 //      tracker says belongs to it (box / pixelate / blur).
 //
 // Analysis thread:
-//   OCR (Tesseract / Windows.Media.Ocr / Apple Vision) -> PiiMatcher ->
-//   RegionTracker.
+//   frame split into overlapping horizontal bands; unchanged bands reuse
+//   their previous result, the rest are OCR'd in parallel (OcrPool, one
+//   engine per thread) -> PiiMatcher -> scan result.
+//
+// Motion thread:
+//   Receives a small grey thumbnail every few frames (more often while
+//   content moves, always for the frame OCR scanned) plus the scan results,
+//   and runs MotionTracker: boxes follow scrolling content, are extrapolated
+//   and widened between samples, and late scans are carried forward to where
+//   the content is now.
 
 #include "pii-redact-filter.h"
 
 #include "core/image.hpp"
 #include "core/pii-matcher.hpp"
-#include "core/region-tracker.hpp"
+#include "core/bands.hpp"
+#include "core/motion-tracker.hpp"
 #include "ocr/ocr-engine.hpp"
+#include "ocr/ocr-pool.hpp"
 
 #include <obs-module.h>
 #include <graphics/vec2.h>
@@ -47,6 +57,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -83,6 +94,7 @@ constexpr const char *S_TESSDATA = "tessdata_path";
 constexpr const char *S_FAST = "ocr_fast";
 constexpr const char *S_INTERVAL = "interval_ms";
 constexpr const char *S_SCALE = "ocr_scale";
+constexpr const char *S_THREADS = "ocr_threads";
 constexpr const char *S_MINCONF = "min_confidence";
 constexpr const char *S_DELAY = "delay_frames";
 constexpr const char *S_FAILSAFE = "fail_safe";
@@ -90,6 +102,20 @@ constexpr const char *S_DEBUG = "debug_outlines";
 constexpr const char *S_STATUS = "status";
 
 constexpr int kMaxDelayFrames = 120;
+constexpr uint32_t kThumbWidth = 512;
+// Motion sampling: every Nth frame while static, every Mth while moving.
+constexpr uint64_t kSampleEveryStatic = 6;
+constexpr uint64_t kSampleEveryMoving = 2;
+constexpr size_t kThumbStages = 3;
+
+size_t auto_threads()
+{
+	const unsigned hw = std::thread::hardware_concurrency();
+	if (hw <= 2)
+		return 1;
+	// Leave room for OBS itself and the encoder.
+	return std::min<size_t>(8, static_cast<size_t>(hw) * 3 / 4);
+}
 
 enum class Style : int { Box = 0, Pixelate = 1, Blur = 2 };
 
@@ -136,6 +162,24 @@ struct AnalysisSettings {
 	OcrConfig ocr;
 	double scale = 1.0;
 	int padding = 6;
+	size_t threads = 1;
+};
+
+struct MotionEvent {
+	enum class Kind { Frame, Scan } kind = Kind::Frame;
+	uint64_t seq = 0;
+	uint64_t ts = 0;
+	Image thumb; // BGRA (Frame)
+	uint32_t full_w = 0;
+	uint32_t full_h = 0;
+	std::vector<Rect> rects; // (Scan)
+};
+
+struct BandCache {
+	Band band;
+	Image signature;         // small grey copy for change detection
+	std::vector<Rect> rects; // detections, full resolution
+	bool valid = false;
 };
 
 struct Job {
@@ -168,7 +212,9 @@ private:
 	void reset_ring(uint32_t width, uint32_t height, size_t slots);
 	void free_graphics();
 	bool capture(Slot &slot, uint32_t width, uint32_t height);
-	void schedule_analysis(const Slot &slot, const RenderSettings &rs);
+	// Returns true when this frame was staged for OCR.
+	bool schedule_analysis(const Slot &slot, const RenderSettings &rs);
+	void sample_motion(const Slot &slot, bool force);
 	void draw_texture(gs_texture_t *tex, uint32_t width, uint32_t height);
 	void draw_solid(const std::vector<Rect> &rects, uint32_t color);
 	void draw_filtered(gs_texture_t *tex, const std::vector<Rect> &rects, const RenderSettings &rs, uint32_t width,
@@ -177,6 +223,9 @@ private:
 
 	// analysis thread
 	void worker_main();
+	// motion thread
+	void motion_main();
+	void post_motion(MotionEvent ev);
 
 	void set_status(const std::string &s);
 
@@ -211,8 +260,32 @@ private:
 	Job job_;
 	std::atomic<bool> worker_busy_{false};
 
-	std::mutex tracker_mutex_;
-	RegionTracker tracker_;
+	// Motion sampling (render thread)
+	gs_texrender_t *thumb_tr_ = nullptr;
+	gs_stagesurf_t *thumb_stage_[kThumbStages] = {};
+	bool thumb_pending_[kThumbStages] = {};
+	uint64_t thumb_seq_[kThumbStages] = {};
+	uint64_t thumb_ts_[kThumbStages] = {};
+	size_t thumb_next_ = 0;
+	uint32_t thumb_w_ = 0;
+	uint32_t thumb_h_ = 0;
+	uint64_t last_sample_seq_ = 0;
+
+	// Motion thread
+	std::thread motion_thread_;
+	std::mutex motion_mutex_;
+	std::condition_variable motion_cv_;
+	std::deque<MotionEvent> motion_queue_;
+	bool motion_stopping_ = false;
+	std::atomic<bool> moving_{false};
+	std::atomic<bool> force_scan_{false};
+	std::atomic<uint64_t> persist_ns_{1500000000ULL};
+	std::atomic<int> delay_frames_{0};
+	std::atomic<double> speed_px_s_{0.0};
+	std::atomic<size_t> track_count_{0};
+
+	std::mutex view_mutex_;
+	std::shared_ptr<const TrackerView> view_;
 
 	std::mutex status_mutex_;
 	std::string status_ = "Waiting for first frame...";
@@ -235,6 +308,7 @@ PiiRedactFilter::PiiRedactFilter(obs_source_t *source) : context_(source)
 	}
 
 	worker_ = std::thread(&PiiRedactFilter::worker_main, this);
+	motion_thread_ = std::thread(&PiiRedactFilter::motion_main, this);
 }
 
 PiiRedactFilter::~PiiRedactFilter()
@@ -246,6 +320,13 @@ PiiRedactFilter::~PiiRedactFilter()
 	job_cv_.notify_all();
 	if (worker_.joinable())
 		worker_.join();
+	{
+		std::lock_guard<std::mutex> lock(motion_mutex_);
+		motion_stopping_ = true;
+	}
+	motion_cv_.notify_all();
+	if (motion_thread_.joinable())
+		motion_thread_.join();
 
 	obs_enter_graphics();
 	free_graphics();
@@ -286,6 +367,8 @@ void PiiRedactFilter::update(obs_data_t *settings)
 	as.ocr.fast_mode = obs_data_get_bool(settings, S_FAST);
 	as.scale = std::clamp(obs_data_get_double(settings, S_SCALE), 0.25, 3.0);
 	as.padding = static_cast<int>(obs_data_get_int(settings, S_PADDING));
+	const long long threads = obs_data_get_int(settings, S_THREADS);
+	as.threads = threads <= 0 ? auto_threads() : static_cast<size_t>(std::min<long long>(threads, 32));
 
 	const uint64_t persist_ns =
 		static_cast<uint64_t>(std::max<long long>(0, obs_data_get_int(settings, S_PERSIST))) * 1000000ULL;
@@ -296,10 +379,8 @@ void PiiRedactFilter::update(obs_data_t *settings)
 		analysis_settings_ = std::move(as);
 		analysis_generation_++;
 	}
-	{
-		std::lock_guard<std::mutex> lock(tracker_mutex_);
-		tracker_.set_persistence_ns(persist_ns);
-	}
+	persist_ns_ = persist_ns;
+	delay_frames_ = rs.delay_frames;
 }
 
 void PiiRedactFilter::set_status(const std::string &s)
@@ -314,13 +395,14 @@ void PiiRedactFilter::set_status(const std::string &s)
 
 void PiiRedactFilter::worker_main()
 {
-	std::unique_ptr<OcrEngine> engine;
+	std::unique_ptr<OcrPool> pool;
 	std::unique_ptr<PiiMatcher> matcher;
 	uint64_t generation = UINT64_MAX;
 	AnalysisSettings as;
-	std::string engine_error;
-	// Rebuilding the OCR engine is expensive; only do it when its config changed.
-	std::string engine_key;
+	// Rebuilding the OCR engines is expensive; only do it when their config changed.
+	std::string pool_key;
+	std::vector<BandCache> cache;
+	double avg_ms = 0.0;
 
 	for (;;) {
 		Job job;
@@ -346,23 +428,25 @@ void PiiRedactFilter::worker_main()
 			matcher = std::make_unique<PiiMatcher>(as.matcher);
 			for (const std::string &bad : matcher->invalid_patterns())
 				obs_log(LOG_WARNING, "ignoring invalid custom regex: %s", bad.c_str());
+			cache.clear(); // detections depend on the matcher settings
 
 			const std::string key = std::string(ocr_backend_id(as.ocr.backend)) + "|" + as.ocr.language +
-						"|" + as.ocr.tessdata_path + "|" + (as.ocr.fast_mode ? "1" : "0");
-			if (key != engine_key) {
-				engine_key = key;
-				engine.reset();
-				engine_error.clear();
-				engine = create_ocr_engine(as.ocr, engine_error);
-				if (engine)
-					obs_log(LOG_INFO, "OCR engine: %s", engine->name());
+						"|" + as.ocr.tessdata_path + "|" + (as.ocr.fast_mode ? "1" : "0") +
+						"|" + std::to_string(as.threads);
+			if (key != pool_key) {
+				pool_key = key;
+				pool.reset();
+				pool = std::make_unique<OcrPool>(as.ocr, as.threads);
+				if (pool->ok())
+					obs_log(LOG_INFO, "OCR engine: %s x %zu threads", pool->engine_name().c_str(),
+						pool->size());
 				else
-					obs_log(LOG_ERROR, "OCR engine unavailable: %s", engine_error.c_str());
+					obs_log(LOG_ERROR, "OCR engine unavailable: %s", pool->error().c_str());
 			}
 		}
 
-		if (!engine) {
-			set_status("OCR unavailable: " + engine_error);
+		if (!pool || !pool->ok()) {
+			set_status("OCR unavailable: " + (pool ? pool->error() : std::string("not initialised")));
 			worker_busy_ = false;
 			continue;
 		}
@@ -379,39 +463,153 @@ void PiiRedactFilter::worker_main()
 		const double back_x = static_cast<double>(src_w) / img.width;
 		const double back_y = static_cast<double>(src_h) / img.height;
 
-		std::vector<OcrLine> lines = engine->recognize(img);
-		std::vector<Detection> detections = matcher->match(lines);
+		// Overlapping bands, one or more per OCR thread. The overlap must
+		// exceed the tallest line of text we want to catch whole.
+		const int ih = static_cast<int>(img.height);
+		const int overlap = std::max(48, ih / 14);
+		const std::vector<Band> bands =
+			plan_bands(ih, static_cast<int>(pool->size()), overlap, std::max(160, overlap * 3));
+		if (cache.size() != bands.size())
+			cache.assign(bands.size(), BandCache());
+
+		std::vector<Image> crops(bands.size());
+		std::vector<const Image *> todo;
+		std::vector<size_t> todo_idx;
+		for (size_t i = 0; i < bands.size(); i++) {
+			const Band &b = bands[i];
+			crops[i] = crop(img, Rect{0, b.y, static_cast<int>(img.width), b.h});
+			Image sig = to_grey(crops[i]);
+			sig = resize(sig, std::max<uint32_t>(1, sig.width / 4), std::max<uint32_t>(1, sig.height / 4));
+			BandCache &c = cache[i];
+			const bool unchanged = c.valid && c.band == b && mean_abs_diff(sig, c.signature, 1) < 1.0;
+			c.band = b;
+			c.signature = std::move(sig);
+			if (!unchanged) {
+				c.valid = false;
+				todo.push_back(&crops[i]);
+				todo_idx.push_back(i);
+			}
+		}
+
+		const std::vector<std::vector<OcrLine>> results = pool->run(todo);
+
+		size_t words = 0;
+		for (size_t k = 0; k < todo_idx.size(); k++) {
+			BandCache &c = cache[todo_idx[k]];
+			std::vector<OcrLine> lines = results[k];
+			for (OcrLine &l : lines) {
+				for (OcrWord &w : l.words)
+					w.box.y += c.band.y;
+				words += l.words.size();
+			}
+			c.rects.clear();
+			for (const Detection &d : matcher->match(lines)) {
+				Rect r = d.box.scaled(back_x, back_y)
+						 .padded(as.padding)
+						 .clipped(static_cast<int>(src_w), static_cast<int>(src_h));
+				if (!r.empty())
+					c.rects.push_back(r);
+			}
+			c.valid = true;
+		}
 
 		std::vector<Rect> rects;
-		rects.reserve(detections.size());
-		for (const Detection &d : detections) {
-			Rect r = d.box.scaled(back_x, back_y)
-					 .padded(as.padding)
-					 .clipped(static_cast<int>(src_w), static_cast<int>(src_h));
-			if (!r.empty())
-				rects.push_back(r);
-		}
+		for (const BandCache &c : cache)
+			rects.insert(rects.end(), c.rects.begin(), c.rects.end());
+		rects = merge_rects(std::move(rects));
+		const size_t redactions = rects.size();
 
-		{
-			std::lock_guard<std::mutex> lock(tracker_mutex_);
-			tracker_.add_result(job.seq, job.ts, std::move(rects));
-		}
+		MotionEvent ev;
+		ev.kind = MotionEvent::Kind::Scan;
+		ev.seq = job.seq;
+		ev.ts = job.ts;
+		ev.rects = std::move(rects);
+		post_motion(std::move(ev));
 
-		const auto ms =
-			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-				.count();
-		size_t words = 0;
-		for (const OcrLine &l : lines)
-			words += l.words.size();
-		char buf[256];
-		snprintf(buf, sizeof(buf), "%s: last scan %lld ms, %zu words, %zu redactions (%ux%u @ %.2fx)",
-			 engine->name(), static_cast<long long>(ms), words, detections.size(), src_w, src_h, as.scale);
+		const double ms =
+			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+		// Total latency = time since the frame was captured (staging + OCR).
+		const double latency_ms = static_cast<double>(os_gettime_ns() - job.ts) / 1e6;
+		avg_ms = avg_ms == 0.0 ? ms : avg_ms * 0.8 + ms * 0.2;
+		char buf[384];
+		snprintf(buf, sizeof(buf),
+			 "%s x%zu: scan %.0f ms (avg %.0f), latency %.0f ms | %zu/%zu bands re-read, %zu words | "
+			 "%zu redactions, %zu tracked | motion %.0f px/s",
+			 pool->engine_name().c_str(), pool->size(), ms, avg_ms, latency_ms, todo.size(), bands.size(),
+			 words, redactions, track_count_.load(), speed_px_s_.load());
 		set_status(buf);
 
 		worker_busy_ = false;
 	}
 
-	engine.reset();
+	pool.reset();
+}
+
+// ---------------------------------------------------------------------------
+// Motion thread
+// ---------------------------------------------------------------------------
+
+void PiiRedactFilter::post_motion(MotionEvent ev)
+{
+	{
+		std::lock_guard<std::mutex> lock(motion_mutex_);
+		motion_queue_.push_back(std::move(ev));
+		// Never let a stalled thread pile up thumbnails.
+		while (motion_queue_.size() > 64)
+			motion_queue_.pop_front();
+	}
+	motion_cv_.notify_one();
+}
+
+void PiiRedactFilter::motion_main()
+{
+	MotionTracker tracker;
+	uint64_t last_ts = 0;
+	uint64_t last_seq = 0;
+
+	for (;;) {
+		std::deque<MotionEvent> batch;
+		{
+			std::unique_lock<std::mutex> lock(motion_mutex_);
+			motion_cv_.wait(lock, [this] { return motion_stopping_ || !motion_queue_.empty(); });
+			if (motion_stopping_)
+				break;
+			batch.swap(motion_queue_);
+		}
+
+		MotionConfig cfg = tracker.config();
+		cfg.persist_ns = persist_ns_;
+		tracker.set_config(cfg);
+
+		for (MotionEvent &ev : batch) {
+			if (ev.kind == MotionEvent::Kind::Frame) {
+				tracker.add_frame(ev.seq, ev.ts, to_grey(ev.thumb), ev.full_w, ev.full_h);
+				if (ev.seq > last_seq && last_seq) {
+					// Video frames per second from the sample timestamps.
+					const double dt = static_cast<double>(ev.ts - last_ts) / 1e9;
+					const double frames = static_cast<double>(ev.seq - last_seq);
+					if (dt > 0)
+						speed_px_s_ = tracker.max_speed() * frames / dt;
+				}
+				last_ts = ev.ts;
+				last_seq = ev.seq;
+			} else {
+				tracker.add_scan(ev.seq, std::move(ev.rects));
+			}
+		}
+
+		if (tracker.take_rescan_request())
+			force_scan_ = true;
+		moving_ = tracker.max_speed() > 0.5;
+		track_count_ = tracker.track_count();
+
+		// Render needs positions from the oldest frame it may still output.
+		const uint64_t newest = tracker.newest_frame_seq();
+		const uint64_t keep = static_cast<uint64_t>(delay_frames_.load()) + 8;
+		auto view = std::make_shared<const TrackerView>(tracker.view(newest > keep ? newest - keep : 0));
+		std::lock_guard<std::mutex> lock(view_mutex_);
+		view_ = std::move(view);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +623,13 @@ void PiiRedactFilter::free_graphics()
 	ring_.clear();
 	gs_stagesurface_destroy(stage_);
 	stage_ = nullptr;
+	gs_texrender_destroy(thumb_tr_);
+	thumb_tr_ = nullptr;
+	for (size_t i = 0; i < kThumbStages; i++) {
+		gs_stagesurface_destroy(thumb_stage_[i]);
+		thumb_stage_[i] = nullptr;
+		thumb_pending_[i] = false;
+	}
 	if (stage_pending_) {
 		// The staged frame will never be handed to the worker.
 		stage_pending_ = false;
@@ -443,8 +648,69 @@ void PiiRedactFilter::reset_ring(uint32_t width, uint32_t height, size_t slots)
 	height_ = height;
 	write_idx_ = 0;
 
-	std::lock_guard<std::mutex> lock(tracker_mutex_);
-	tracker_.clear();
+	thumb_w_ = std::min(kThumbWidth, width);
+	thumb_h_ = std::max<uint32_t>(1, static_cast<uint32_t>(static_cast<uint64_t>(height) * thumb_w_ / width));
+	thumb_tr_ = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
+	for (size_t i = 0; i < kThumbStages; i++)
+		thumb_stage_[i] = gs_stagesurface_create(thumb_w_, thumb_h_, GS_BGRA);
+	last_sample_seq_ = 0;
+}
+
+void PiiRedactFilter::sample_motion(const Slot &slot, bool force)
+{
+	if (!thumb_tr_)
+		return;
+
+	// Hand over thumbnails staged on earlier frames (never the one staged
+	// this frame: mapping it would stall the GPU).
+	for (size_t i = 0; i < kThumbStages; i++) {
+		if (!thumb_pending_[i] || thumb_seq_[i] >= slot.seq)
+			continue;
+		uint8_t *data = nullptr;
+		uint32_t linesize = 0;
+		if (gs_stagesurface_map(thumb_stage_[i], &data, &linesize)) {
+			MotionEvent ev;
+			ev.kind = MotionEvent::Kind::Frame;
+			ev.seq = thumb_seq_[i];
+			ev.ts = thumb_ts_[i];
+			ev.thumb = image_from_bgra(data, thumb_w_, thumb_h_, linesize);
+			ev.full_w = width_;
+			ev.full_h = height_;
+			gs_stagesurface_unmap(thumb_stage_[i]);
+			post_motion(std::move(ev));
+		}
+		thumb_pending_[i] = false;
+	}
+
+	// Sample sparsely: often enough to measure motion, not every frame.
+	const uint64_t every = moving_ ? kSampleEveryMoving : kSampleEveryStatic;
+	if (!force && last_sample_seq_ && slot.seq - last_sample_seq_ < every)
+		return;
+	if (thumb_pending_[thumb_next_])
+		return; // all stages busy (should not happen)
+
+	gs_texture_t *tex = gs_texrender_get_texture(slot.texrender);
+	if (!tex)
+		return;
+	gs_texrender_reset(thumb_tr_);
+	if (!gs_texrender_begin(thumb_tr_, thumb_w_, thumb_h_))
+		return;
+	gs_ortho(0.0f, static_cast<float>(width_), 0.0f, static_cast<float>(height_), -100.0f, 100.0f);
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_effect_set_texture(gs_effect_get_param_by_name(effect, "image"), tex);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(tex, 0, width_, height_);
+	gs_blend_state_pop();
+	gs_texrender_end(thumb_tr_);
+
+	gs_stage_texture(thumb_stage_[thumb_next_], gs_texrender_get_texture(thumb_tr_));
+	thumb_pending_[thumb_next_] = true;
+	thumb_seq_[thumb_next_] = slot.seq;
+	thumb_ts_[thumb_next_] = slot.ts;
+	thumb_next_ = (thumb_next_ + 1) % kThumbStages;
+	last_sample_seq_ = slot.seq;
 }
 
 bool PiiRedactFilter::capture(Slot &slot, uint32_t width, uint32_t height)
@@ -471,10 +737,10 @@ bool PiiRedactFilter::capture(Slot &slot, uint32_t width, uint32_t height)
 	return true;
 }
 
-void PiiRedactFilter::schedule_analysis(const Slot &slot, const RenderSettings &rs)
+bool PiiRedactFilter::schedule_analysis(const Slot &slot, const RenderSettings &rs)
 {
 	if (!stage_)
-		return;
+		return false;
 
 	// Map the frame staged on a previous render (mapping the frame we
 	// just staged would stall the GPU pipeline).
@@ -497,22 +763,26 @@ void PiiRedactFilter::schedule_analysis(const Slot &slot, const RenderSettings &
 			worker_busy_ = false;
 		}
 		stage_pending_ = false;
-		return;
+		return false;
 	}
 
+	// OCR always takes the newest frame once it is free, so it naturally
+	// skips as many frames as a scan takes. A lost box forces a scan now.
 	const uint64_t now = os_gettime_ns();
-	if (worker_busy_ || now - last_stage_ns_ < rs.interval_ns)
-		return;
+	if (worker_busy_ || (!force_scan_ && now - last_stage_ns_ < rs.interval_ns))
+		return false;
+	force_scan_ = false;
 
 	gs_texture_t *tex = gs_texrender_get_texture(slot.texrender);
 	if (!tex)
-		return;
+		return false;
 	gs_stage_texture(stage_, tex);
 	stage_pending_ = true;
 	stage_seq_ = slot.seq;
 	stage_ts_ = slot.ts;
 	last_stage_ns_ = now;
 	worker_busy_ = true;
+	return true;
 }
 
 void PiiRedactFilter::draw_texture(gs_texture_t *tex, uint32_t width, uint32_t height)
@@ -626,7 +896,10 @@ void PiiRedactFilter::render()
 	if (capture_pending_.exchange(false)) {
 		Slot &slot = ring_[write_idx_];
 		if (capture(slot, width, height)) {
-			schedule_analysis(slot, rs);
+			// The frame OCR scans is always sampled so its result can be
+			// carried forward exactly.
+			const bool staged = schedule_analysis(slot, rs);
+			sample_motion(slot, staged);
 			write_idx_ = (write_idx_ + 1) % ring_.size();
 		}
 	}
@@ -642,13 +915,20 @@ void PiiRedactFilter::render()
 		return;
 	}
 
-	std::vector<Rect> regions;
-	bool verified = true;
+	std::shared_ptr<const TrackerView> view;
 	{
-		std::lock_guard<std::mutex> lock(tracker_mutex_);
-		regions = tracker_.regions_for(out.ts);
-		verified = tracker_.verified(out.seq);
-		tracker_.prune(out.ts);
+		std::lock_guard<std::mutex> lock(view_mutex_);
+		view = view_;
+	}
+	std::vector<Rect> regions;
+	bool verified = false;
+	if (view) {
+		for (const Rect &r : view->rects_for(out.seq, out.ts)) {
+			const Rect c = r.clipped(static_cast<int>(width), static_cast<int>(height));
+			if (!c.empty())
+				regions.push_back(c);
+		}
+		verified = view->verified(out.seq);
 	}
 
 	if (rs.fail_safe && rs.delay_frames > 0 && !verified && !rs.debug) {
@@ -758,6 +1038,7 @@ obs_properties_t *PiiRedactFilter::properties()
 	obs_properties_add_path(ocr, S_TESSDATA, obs_module_text("PIIRedact.Tessdata"), OBS_PATH_DIRECTORY, nullptr,
 				nullptr);
 	obs_properties_add_bool(ocr, S_FAST, obs_module_text("PIIRedact.FastMode"));
+	obs_properties_add_int(ocr, S_THREADS, obs_module_text("PIIRedact.Threads"), 0, 32, 1);
 	obs_properties_add_int(ocr, S_INTERVAL, obs_module_text("PIIRedact.Interval"), 0, 10000, 50);
 	obs_properties_add_float_slider(ocr, S_SCALE, obs_module_text("PIIRedact.Scale"), 0.25, 3.0, 0.05);
 	obs_properties_add_float_slider(ocr, S_MINCONF, obs_module_text("PIIRedact.MinConfidence"), 0.0, 100.0, 1.0);
@@ -844,7 +1125,8 @@ void filter_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, S_LANGUAGE, "");
 	obs_data_set_default_string(settings, S_TESSDATA, "");
 	obs_data_set_default_bool(settings, S_FAST, false);
-	obs_data_set_default_int(settings, S_INTERVAL, 200);
+	obs_data_set_default_int(settings, S_INTERVAL, 0);
+	obs_data_set_default_int(settings, S_THREADS, 0);
 	obs_data_set_default_double(settings, S_SCALE, 1.0);
 	obs_data_set_default_double(settings, S_MINCONF, 0.0);
 	obs_data_set_default_int(settings, S_DELAY, 0);

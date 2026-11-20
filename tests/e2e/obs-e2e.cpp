@@ -18,6 +18,9 @@ static std::atomic<int> g_frames{0};
 // Per-frame flicker tracking of the e-mail area (x 300..700, y 275..305).
 static int g_first_redacted = -1;
 static int g_flicker_frames = 0;
+// Leak metric: PII in the sample image is drawn in pure red; count red
+// pixels that reach the output.
+static std::vector<int> g_red;
 
 static void raw_cb(void *, struct video_data *frame)
 {
@@ -28,6 +31,16 @@ static void raw_cb(void *, struct video_data *frame)
 	for (int y = 275; y < 305; y++)
 		for (int x = 300; x < 700; x++)
 			sum += frame->data[0][(size_t)y * g_linesize + x * 4 + 1];
+	int red = 0;
+	for (int y = 0; y < 720; y++) {
+		const uint8_t *row = frame->data[0] + (size_t)y * g_linesize;
+		for (int x = 0; x < 1280; x++) {
+			const uint8_t *p = row + x * 4; // BGRA
+			if (p[2] > 150 && p[1] < 100 && p[0] < 100)
+				red++;
+		}
+	}
+	g_red.push_back(red);
 	const bool dark = sum / (30.0 * 400.0) < 25.0;
 	const int n = g_frames++;
 	if (dark && g_first_redacted < 0)
@@ -111,6 +124,18 @@ int main(int argc, char **argv)
 		printf("filter create failed\n");
 		return 7;
 	}
+	if (getenv("SCROLL")) {
+		// Built-in scroll filter in front of ours: a continuously scrolling page.
+		if (!load("/usr/lib/x86_64-linux-gnu/obs-plugins/obs-filters.so",
+			  "/usr/share/obs/obs-plugins/obs-filters"))
+			return 8;
+		obs_data_t *ss = obs_data_create();
+		obs_data_set_double(ss, "speed_y", atof(getenv("SCROLL")));
+		obs_source_t *scroll = obs_source_create("scroll_filter", "scroll", ss, nullptr);
+		obs_data_release(ss);
+		obs_source_filter_add(img, scroll);
+		obs_source_release(scroll);
+	}
 	obs_source_filter_add(img, filter);
 	obs_set_output_source(0, img);
 
@@ -134,6 +159,22 @@ int main(int argc, char **argv)
 	}
 	printf("frames captured: %d\n", g_frames.load());
 	printf("first redacted frame: %d, unredacted frames after that: %d\n", g_first_redacted, g_flicker_frames);
+	{
+		// Skip the first 2 s (start-up: first scans) then report leaks.
+		std::lock_guard<std::mutex> l(g_mtx);
+		const size_t skip = 60;
+		int leak_frames = 0, max_red = 0;
+		long total = 0;
+		for (size_t i = skip; i < g_red.size(); i++) {
+			if (g_red[i] > 30)
+				leak_frames++;
+			max_red = g_red[i] > max_red ? g_red[i] : max_red;
+			total += g_red[i];
+		}
+		const size_t n = g_red.size() > skip ? g_red.size() - skip : 0;
+		printf("leak: %d of %zu frames show PII pixels (max %d px, avg %.1f px)\n", leak_frames, n, max_red,
+		       n ? (double)total / n : 0.0);
+	}
 
 	obs_set_output_source(0, nullptr);
 	obs_source_release(filter);

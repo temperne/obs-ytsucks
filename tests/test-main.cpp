@@ -1,7 +1,8 @@
 // Minimal self-contained test runner for src/core (no external framework).
 #include "image.hpp"
 #include "pii-matcher.hpp"
-#include "region-tracker.hpp"
+#include "bands.hpp"
+#include "motion-tracker.hpp"
 
 #include <cstdio>
 #include <functional>
@@ -171,80 +172,134 @@ static void test_rects()
 	CHECK(merged.size() == 2);
 }
 
-static void test_tracker()
+// Synthetic "web page": random texture, rendered with a vertical scroll.
+static Image page_frame(int w, int h, int scroll_y)
+{
+	Image img;
+	img.width = static_cast<uint32_t>(w);
+	img.height = static_cast<uint32_t>(h);
+	img.channels = 1;
+	img.pixels.resize(static_cast<size_t>(w) * h);
+	for (int y = 0; y < h; y++) {
+		for (int x = 0; x < w; x++) {
+			const uint32_t py = static_cast<uint32_t>(y + scroll_y + 1000);
+			uint32_t v = static_cast<uint32_t>(x) * 73856093u ^ py * 19349663u;
+			v ^= v >> 13;
+			v *= 0x5bd1e995u;
+			v ^= v >> 15;
+			img.pixels[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(v & 0xFF);
+		}
+	}
+	return img;
+}
+
+static void test_match_patch()
+{
+	Image a = page_frame(128, 96, 0);
+	Image b = page_frame(128, 96, 5); // content moved up by 5
+	int dx = 0, dy = 0;
+	double err = 0;
+	match_patch(a, b, Rect{40, 40, 30, 10}, 0, 0, 16, dx, dy, err);
+	CHECK(dx == 0 && dy == -5);
+	CHECK(err >= 0 && err < 1.0);
+	// Prediction already right: early exit.
+	match_patch(a, b, Rect{40, 40, 30, 10}, 0, -5, 16, dx, dy, err);
+	CHECK(dx == 0 && dy == -5);
+	// Large sparse-sample motion with a bigger radius.
+	Image c = page_frame(128, 96, 30);
+	match_patch(a, c, Rect{40, 50, 30, 10}, 0, 0, 40, dx, dy, err);
+	CHECK(dx == 0 && dy == -30);
+}
+
+static void test_motion_tracker()
 {
 	const uint64_t ms = 1000000ULL;
-	const Rect A{0, 0, 10, 10};
-	const Rect B{50, 50, 10, 10};
+	// Thumbnails are 1/4 of the 512x384 "full" resolution.
+	const uint32_t FW = 512, FH = 384;
 
 	{
-		RegionTracker t;
-		t.set_persistence_ns(500 * ms);
-		CHECK(!t.verified(1));
-		t.add_result(10, 1000 * ms, {A});
-		CHECK(t.verified(10));
-		CHECK(t.verified(5));
-		CHECK(!t.verified(11));
-		// Look-ahead: a frame captured shortly before the scanned frame.
-		CHECK(t.regions_for(900 * ms).size() == 1);
-		// Regression (blinking): with no newer scan the box must stay up,
-		// however long the next scan takes.
-		CHECK(t.regions_for(1400 * ms).size() == 1);
-		CHECK(t.regions_for(9000 * ms).size() == 1);
+		// Static screen: box stays, lifetime rule holds.
+		MotionTracker t;
+		MotionConfig cfg;
+		cfg.persist_ns = 500 * ms;
+		t.set_config(cfg);
+		for (uint64_t f = 1; f <= 10; f++)
+			t.add_frame(f, f * 33 * ms, page_frame(128, 96, 0), FW, FH);
+		t.add_scan(10, {Rect{100, 100, 80, 20}});
+		auto v = t.view(0);
+		CHECK(v.verified(10) && !v.verified(11));
+		CHECK(v.rects_for(10, 330 * ms).size() == 1);
+		// Far in the future with no newer scan: still covered.
+		CHECK(v.rects_for(500, 99999 * ms).size() == 1);
+		// Two scans that miss it -> dead after persist.
+		t.add_frame(20, 660 * ms, page_frame(128, 96, 0), FW, FH);
+		t.add_scan(20, {});
+		CHECK(t.view(0).rects_for(20, 660 * ms).size() == 1);
+		t.add_frame(30, 990 * ms, page_frame(128, 96, 0), FW, FH);
+		t.add_scan(30, {});
+		auto v2 = t.view(0);
+		CHECK(v2.rects_for(30, 1400 * ms).size() == 1);
+		CHECK(v2.rects_for(30, 1600 * ms).empty());
 	}
 
 	{
-		// Slow scans (2 s each) with persist far shorter than the scan time:
-		// text visible in every scan must be covered continuously.
-		RegionTracker t;
-		t.set_persistence_ns(100 * ms);
-		t.add_result(1, 1000 * ms, {A});
-		t.add_result(2, 3000 * ms, {A});
-		t.add_result(3, 5000 * ms, {A});
-		for (uint64_t f = 1000; f <= 8000; f += 50)
-			CHECK(t.regions_for(f * ms).size() == 1);
+		// Scrolling page, sampled every 3rd frame, 2 thumb px per frame
+		// (= 8 full px per frame). OCR result for frame 3 arrives late
+		// (after frame 15 was sampled): the box must land where the text
+		// is at frame 15, and extrapolate beyond.
+		MotionTracker t;
+		const int speed = 2; // thumbnail px per frame
+		for (uint64_t f = 0; f <= 15; f += 3)
+			t.add_frame(f + 1, (f + 1) * 33 * ms, page_frame(128, 96, static_cast<int>(f) * speed), FW, FH);
+		// Text at full-res y=200 in frame 4 (scroll 3*2 thumb px).
+		const Rect det{100, 200, 80, 16};
+		t.add_scan(4, {det});
+		auto v = t.view(0);
+		auto at16 = v.rects_for(16, 16 * 33 * ms);
+		CHECK(at16.size() == 1);
+		if (!at16.empty()) {
+			// Expected y at frame 16: 200 - (16-4)*speed*4 = 104.
+			CHECK(std::abs(at16[0].y - 104) <= 4);
+		}
+		// Velocity measured: about -8 full px per frame.
+		CHECK(t.max_speed() > 6.0 && t.max_speed() < 10.0);
+		// Extrapolated frame 18 (not sampled): box widened to cover y=88.
+		auto at18 = v.rects_for(18, 18 * 33 * ms);
+		CHECK(at18.size() == 1);
+		if (!at18.empty()) {
+			CHECK(at18[0].y <= 88 && at18[0].bottom() >= 88 + 16);
+		}
 	}
 
 	{
-		// Text disappears: hold through one missed scan (default), then
-		// expire `persist` after the second scan that did not see it.
-		RegionTracker t;
-		t.set_persistence_ns(500 * ms);
-		t.add_result(1, 1000 * ms, {A});
-		t.add_result(2, 2000 * ms, {});
-		CHECK(t.regions_for(2500 * ms).size() == 1); // one miss tolerated
-		t.add_result(3, 3000 * ms, {});
-		CHECK(t.regions_for(3400 * ms).size() == 1);
-		CHECK(t.regions_for(3600 * ms).empty());
-
-		t.set_tolerated_misses(0);
-		CHECK(t.regions_for(2400 * ms).size() == 1);
-		CHECK(t.regions_for(2600 * ms).empty());
+		// Look-back: in delayed output, frames between the previous scan
+		// and the scan that first saw the text are covered too.
+		MotionTracker t;
+		for (uint64_t f = 1; f <= 9; f += 2)
+			t.add_frame(f, f * 33 * ms, page_frame(128, 96, 0), FW, FH);
+		t.add_scan(3, {});
+		t.add_scan(9, {Rect{40, 40, 40, 12}});
+		auto v = t.view(0);
+		CHECK(v.rects_for(2, 66 * ms).empty());
+		CHECK(v.rects_for(4, 132 * ms).size() == 1);
 	}
+}
 
-	{
-		// Look-back to the previous scan: text first seen at 2000 was not
-		// there at 1000, so (delayed) frames after 1000 are covered.
-		RegionTracker t;
-		t.set_persistence_ns(200 * ms);
-		t.add_result(1, 1000 * ms, {});
-		t.add_result(2, 2000 * ms, {B});
-		CHECK(t.regions_for(900 * ms).empty());
-		CHECK(t.regions_for(1200 * ms).size() == 1);
-	}
+static void test_bands()
+{
+	auto b = plan_bands(1080, 4, 60, 100);
+	CHECK(b.size() == 4);
+	CHECK(b.front().y == 0 && b.back().y + b.back().h == 1080);
+	for (size_t i = 1; i < b.size(); i++)
+		CHECK(b[i].y + 60 <= b[i - 1].y + b[i - 1].h); // overlap >= 60
+	CHECK(plan_bands(200, 8, 40, 150).size() == 1);
+	CHECK(plan_bands(0, 4, 10, 10).empty());
 
-	{
-		RegionTracker t;
-		t.set_persistence_ns(100 * ms);
-		for (uint64_t i = 1; i <= 10; i++)
-			t.add_result(i, i * 1000 * ms, {A});
-		t.prune(9000 * ms);
-		CHECK(t.result_count() < 10);
-		CHECK(t.regions_for(9000 * ms).size() == 1);
-		CHECK(t.regions_for(10000 * ms).size() == 1);
-		t.clear();
-		CHECK(t.result_count() == 0 && !t.verified(0));
-	}
+	Image img = page_frame(64, 32, 0);
+	Image c = crop(img, Rect{10, 5, 20, 8});
+	CHECK(c.width == 20 && c.height == 8 && c.pixels[0] == img.pixels[5 * 64 + 10]);
+	CHECK(mean_abs_diff(img, img) == 0.0);
+	CHECK(mean_abs_diff(img, page_frame(64, 32, 1)) > 10.0);
 }
 
 static void test_image()
@@ -280,7 +335,9 @@ int main()
 		{"keywords/custom", test_keywords_and_custom},
 		{"box mapping", test_box_mapping},
 		{"rects", test_rects},
-		{"tracker", test_tracker},
+		{"match_patch", test_match_patch},
+		{"motion tracker", test_motion_tracker},
+		{"bands", test_bands},
 		{"image", test_image},
 	};
 	for (const auto &t : tests) {

@@ -62,4 +62,38 @@ Rect Rect::scaled(double sx, double sy) const
 	return {l, t, r - l, b - t};
 }
 
+std::vector<Rect> merge_rects(std::vector<Rect> rects)
+{
+	rects.erase(std::remove_if(rects.begin(), rects.end(), [](const Rect &r) { return r.empty(); }), rects.end());
+
+	bool merged = true;
+	while (merged) {
+		merged = false;
+		for (size_t i = 0; i < rects.size() && !merged; i++) {
+			for (size_t j = i + 1; j < rects.size(); j++) {
+				if (rects[i].padded(1).intersects(rects[j])) {
+					rects[i] = rects[i].united(rects[j]);
+					rects.erase(rects.begin() + static_cast<std::ptrdiff_t>(j));
+					merged = true;
+					break;
+				}
+			}
+		}
+	}
+	return rects;
+}
+
+double iou(const Rect &a, const Rect &b)
+{
+	const int l = std::max(a.x, b.x);
+	const int t = std::max(a.y, b.y);
+	const int r = std::min(a.right(), b.right());
+	const int btm = std::min(a.bottom(), b.bottom());
+	if (r <= l || btm <= t)
+		return 0.0;
+	const double inter = static_cast<double>(r - l) * (btm - t);
+	const double uni = static_cast<double>(a.w) * a.h + static_cast<double>(b.w) * b.h - inter;
+	return uni > 0 ? inter / uni : 0.0;
+}
+
 } // namespace pii

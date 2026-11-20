@@ -35,6 +35,8 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
+find_package(Threads REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Threads::Threads)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
 if(ENABLE_FRONTEND_API)
@@ -67,10 +69,14 @@ target_sources(
     src/core/pii-matcher.hpp
     src/core/pii-types.hpp
     src/core/rect.cpp
-    src/core/region-tracker.cpp
-    src/core/region-tracker.hpp
+    src/core/bands.cpp
+    src/core/bands.hpp
+    src/core/motion-tracker.cpp
+    src/core/motion-tracker.hpp
     src/ocr/ocr-engine.hpp
     src/ocr/ocr-factory.cpp
+    src/ocr/ocr-pool.cpp
+    src/ocr/ocr-pool.hpp
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 
