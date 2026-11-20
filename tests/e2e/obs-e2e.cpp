@@ -41,6 +41,18 @@ static void raw_cb(void *, struct video_data *frame)
 		}
 	}
 	g_red.push_back(red);
+	// Optionally dump a few leaking frames for inspection.
+	static int dumped = 0;
+	const char *dump = getenv("DUMP_DIR");
+	if (dump && red > 30 && g_red.size() > 60 && dumped < 6) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s/leak-%03zu.raw", dump, g_red.size() - 1);
+		FILE *f = fopen(path, "wb");
+		for (int y = 0; y < 720; y++)
+			fwrite(frame->data[0] + (size_t)y * g_linesize, 1, 1280 * 4, f);
+		fclose(f);
+		dumped++;
+	}
 	const bool dark = sum / (30.0 * 400.0) < 25.0;
 	const int n = g_frames++;
 	if (dark && g_first_redacted < 0)
@@ -172,6 +184,11 @@ int main(int argc, char **argv)
 			total += g_red[i];
 		}
 		const size_t n = g_red.size() > skip ? g_red.size() - skip : 0;
+		if (getenv("TIMELINE")) {
+			for (size_t i = 0; i < g_red.size(); i++)
+				printf("%d%s", g_red[i] > 30 ? (g_red[i] > 1000 ? 2 : 1) : 0, (i + 1) % 60 ? "" : "\n");
+			printf("\n");
+		}
 		printf("leak: %d of %zu frames show PII pixels (max %d px, avg %.1f px)\n", leak_frames, n, max_red,
 		       n ? (double)total / n : 0.0);
 	}

@@ -59,6 +59,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <condition_variable>
 #include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -538,6 +539,9 @@ void PiiRedactFilter::worker_main()
 			 pool->engine_name().c_str(), pool->size(), ms, avg_ms, latency_ms, todo.size(), bands.size(),
 			 words, redactions, track_count_.load(), speed_px_s_.load());
 		set_status(buf);
+		static const bool debug_log = getenv("OBS_PII_DEBUG") != nullptr;
+		if (debug_log)
+			obs_log(LOG_INFO, "scan seq=%llu %s", static_cast<unsigned long long>(job.seq), buf);
 
 		worker_busy_ = false;
 	}
