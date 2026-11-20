@@ -21,15 +21,56 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "ocr-engine.hpp"
 
 #include <tesseract/baseapi.h>
+#include <tesseract/ocrclass.h>
 #include <tesseract/resultiterator.h>
 
 #include <cstdlib>
+
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 namespace pii {
 
 namespace {
 
+// Distribution builds of Tesseract use OpenMP. We already run one engine per
+// thread; letting every engine also start its own OpenMP team makes the
+// threads spin against each other (a 25 ms band can take 20 s). The usual
+// fix, OMP_THREAD_LIMIT=1, only works if set before libgomp is loaded,
+// which happens before our module code runs. Instead switch parallel
+// regions off at runtime: with max-active-levels = 0 every region runs on
+// the calling thread. Looked up dynamically so builds without OpenMP work.
+// Must run on every thread that calls into Tesseract: in current OpenMP
+// max-active-levels is a per-thread ("data environment") setting.
+void disable_openmp_parallelism()
+{
+#ifndef _WIN32
+	using SetLevels = void (*)(int);
+	static SetLevels fn = [] {
+		SetLevels f = nullptr;
+		for (const char *lib : {"libgomp.so.1", "libgomp.1.dylib", "libomp.so", "libomp.dylib"}) {
+			void *h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+			if (!h)
+				continue;
+			f = reinterpret_cast<SetLevels>(dlsym(h, "omp_set_max_active_levels"));
+			// Keep the handle: the library stays loaded by Tesseract anyway.
+			if (f)
+				break;
+		}
+		return f;
+	}();
+	thread_local bool done = false;
+	if (fn && !done) {
+		fn(0);
+		done = true;
+	}
+#endif
+}
+
 class TesseractEngine : public OcrEngine {
+	static constexpr int kDeadlineMs = 400;
+
 public:
 	bool init(const OcrConfig &config, std::string &error)
 	{
@@ -52,6 +93,7 @@ public:
 
 	std::vector<OcrLine> recognize(const Image &bgra) override
 	{
+		disable_openmp_parallelism();
 		std::vector<OcrLine> lines;
 		const Image grey = to_grey(bgra);
 		if (grey.empty())
@@ -60,7 +102,11 @@ public:
 		api_.SetImage(grey.pixels.data(), static_cast<int>(grey.width), static_cast<int>(grey.height), 1,
 			      static_cast<int>(grey.stride()));
 		api_.SetSourceResolution(96);
-		if (api_.Recognize(nullptr) != 0)
+		// Tesseract occasionally spends seconds on cut-off glyphs or noise;
+		// cap each band so one bad region cannot stall the whole scan.
+		tesseract::ETEXT_DESC monitor;
+		monitor.set_deadline_msecs(kDeadlineMs);
+		if (api_.Recognize(&monitor) != 0 && !monitor.deadline_exceeded())
 			return lines;
 
 		tesseract::ResultIterator *it = api_.GetIterator();
@@ -103,6 +149,7 @@ private:
 
 std::unique_ptr<OcrEngine> create_tesseract_engine(const OcrConfig &config, std::string &error)
 {
+	disable_openmp_parallelism();
 	auto engine = std::make_unique<TesseractEngine>();
 	if (!engine->init(config, error))
 		return nullptr;

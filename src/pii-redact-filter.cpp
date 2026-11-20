@@ -56,6 +56,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <cstdio>
@@ -100,6 +101,7 @@ constexpr const char *S_MINCONF = "min_confidence";
 constexpr const char *S_DELAY = "delay_frames";
 constexpr const char *S_FAILSAFE = "fail_safe";
 constexpr const char *S_DEBUG = "debug_outlines";
+constexpr const char *S_EDGE = "edge_guard";
 constexpr const char *S_STATUS = "status";
 
 constexpr int kMaxDelayFrames = 120;
@@ -154,6 +156,7 @@ struct RenderSettings {
 	int delay_frames = 0;
 	bool fail_safe = false;
 	bool debug = false;
+	bool edge_guard = true;
 	uint64_t interval_ns = 250000000ULL;
 };
 
@@ -174,13 +177,6 @@ struct MotionEvent {
 	uint32_t full_w = 0;
 	uint32_t full_h = 0;
 	std::vector<Rect> rects; // (Scan)
-};
-
-struct BandCache {
-	Band band;
-	Image signature;         // small grey copy for change detection
-	std::vector<Rect> rects; // detections, full resolution
-	bool valid = false;
 };
 
 struct Job {
@@ -284,6 +280,12 @@ private:
 	std::atomic<int> delay_frames_{0};
 	std::atomic<double> speed_px_s_{0.0};
 	std::atomic<size_t> track_count_{0};
+	// Page scroll measured by the scans (full-res px per video frame, + = down),
+	// the frame it was measured on, and a line height, for the edge guard.
+	std::atomic<double> scroll_vy_{0.0};
+	std::atomic<uint64_t> scroll_seq_{0};
+	std::atomic<int> line_px_{48};
+	std::atomic<uint64_t> latency_frames_{2};
 
 	std::mutex view_mutex_;
 	std::shared_ptr<const TrackerView> view_;
@@ -345,6 +347,7 @@ void PiiRedactFilter::update(obs_data_t *settings)
 	rs.delay_frames = std::clamp(static_cast<int>(obs_data_get_int(settings, S_DELAY)), 0, kMaxDelayFrames);
 	rs.fail_safe = obs_data_get_bool(settings, S_FAILSAFE);
 	rs.debug = obs_data_get_bool(settings, S_DEBUG);
+	rs.edge_guard = obs_data_get_bool(settings, S_EDGE);
 	rs.interval_ns =
 		static_cast<uint64_t>(std::max<long long>(0, obs_data_get_int(settings, S_INTERVAL))) * 1000000ULL;
 
@@ -402,7 +405,15 @@ void PiiRedactFilter::worker_main()
 	AnalysisSettings as;
 	// Rebuilding the OCR engines is expensive; only do it when their config changed.
 	std::string pool_key;
-	std::vector<BandCache> cache;
+	// Previous scan, for scroll-aware reuse.
+	Image prev_sig;
+	std::vector<Rect> prev_rects;
+	// Per signature row: was it read by OCR with full line context? Rows
+	// read right at the frame edge (text possibly cut off) are not, and get
+	// re-read once they scroll inwards.
+	std::vector<uint8_t> prev_verified;
+	uint64_t prev_seq = 0;
+	bool prev_valid = false;
 	double avg_ms = 0.0;
 
 	for (;;) {
@@ -429,7 +440,7 @@ void PiiRedactFilter::worker_main()
 			matcher = std::make_unique<PiiMatcher>(as.matcher);
 			for (const std::string &bad : matcher->invalid_patterns())
 				obs_log(LOG_WARNING, "ignoring invalid custom regex: %s", bad.c_str());
-			cache.clear(); // detections depend on the matcher settings
+			prev_valid = false; // detections depend on the matcher settings
 
 			const std::string key = std::string(ocr_backend_id(as.ocr.backend)) + "|" + as.ocr.language +
 						"|" + as.ocr.tessdata_path + "|" + (as.ocr.fast_mode ? "1" : "0") +
@@ -464,62 +475,126 @@ void PiiRedactFilter::worker_main()
 		const double back_x = static_cast<double>(src_w) / img.width;
 		const double back_y = static_cast<double>(src_h) / img.height;
 
-		// Overlapping bands, one or more per OCR thread. The overlap must
+		// Small overlapping bands (several per OCR thread). The overlap must
 		// exceed the tallest line of text we want to catch whole.
 		const int ih = static_cast<int>(img.height);
-		const int overlap = std::max(48, ih / 14);
-		const std::vector<Band> bands =
-			plan_bands(ih, static_cast<int>(pool->size()), overlap, std::max(160, overlap * 3));
-		if (cache.size() != bands.size())
-			cache.assign(bands.size(), BandCache());
+		const int overlap = std::max(40, ih / 18);
+		const int band_count = std::max(static_cast<int>(pool->size()), ih / 128);
+		const std::vector<Band> bands = plan_bands(ih, band_count, overlap, overlap * 2 + 32);
 
-		std::vector<Image> crops(bands.size());
+		// Scroll-aware change detection on a 1/4 size grey copy: a band whose
+		// content equals the previous scan's content shifted by the scroll
+		// offset (or unshifted) keeps the previous detections, moved by that
+		// offset. Only bands with new content are OCR'd, which while
+		// scrolling is essentially the strip that just came into view.
+		Image sig = to_grey(img);
+		sig = resize(sig, std::max<uint32_t>(1, sig.width / 4), std::max<uint32_t>(1, sig.height / 4));
+		const double sig_to_img = static_cast<double>(ih) / sig.height;
+		const bool have_prev = prev_valid && prev_sig.width == sig.width && prev_sig.height == sig.height;
+		const int scroll = have_prev ? estimate_vertical_shift(prev_sig, sig, static_cast<int>(sig.height) / 2)
+					     : 0;
+
+		std::vector<Rect> dets; // scaled-image coordinates, unpadded
+		std::vector<Image> crops;
+		crops.reserve(bands.size());
 		std::vector<const Image *> todo;
-		std::vector<size_t> todo_idx;
-		for (size_t i = 0; i < bands.size(); i++) {
-			const Band &b = bands[i];
-			crops[i] = crop(img, Rect{0, b.y, static_cast<int>(img.width), b.h});
-			Image sig = to_grey(crops[i]);
-			sig = resize(sig, std::max<uint32_t>(1, sig.width / 4), std::max<uint32_t>(1, sig.height / 4));
-			BandCache &c = cache[i];
-			const bool unchanged = c.valid && c.band == b && mean_abs_diff(sig, c.signature, 1) < 1.0;
-			c.band = b;
-			c.signature = std::move(sig);
-			if (!unchanged) {
-				c.valid = false;
-				todo.push_back(&crops[i]);
-				todo_idx.push_back(i);
+		std::vector<int> todo_y;
+		const int sh = static_cast<int>(sig.height);
+		std::vector<uint8_t> verified(static_cast<size_t>(sh), 0);
+		const int edge_rows = static_cast<int>(std::ceil(overlap / sig_to_img));
+		for (const Band &b : bands) {
+			bool reuse = false;
+			int shift = 0;
+			const int y0 = static_cast<int>(b.y / sig_to_img);
+			const int y1 = std::min(sh, static_cast<int>(std::ceil((b.y + b.h) / sig_to_img)));
+			if (have_prev) {
+				for (int cand : {scroll, 0}) {
+					double new_rows = 1.0;
+					const double diff = shifted_band_diff(prev_sig, sig, y0, y1, cand, new_rows);
+					bool all_verified = new_rows == 0.0;
+					for (int y = y0; all_verified && y < y1; y++)
+						all_verified = prev_verified[static_cast<size_t>(y - cand)] != 0;
+					if (all_verified && diff < 2.0) {
+						reuse = true;
+						shift = static_cast<int>(std::lround(cand * sig_to_img));
+						for (int y = y0; y < y1; y++)
+							verified[static_cast<size_t>(y)] = 1;
+						break;
+					}
+					if (cand == 0)
+						break;
+				}
 			}
+			if (reuse) {
+				for (const Rect &r : prev_rects) {
+					Rect m = r;
+					m.y += shift;
+					const int cy = m.y + m.h / 2;
+					if (cy >= b.y && cy < b.y + b.h) {
+						m = m.clipped(static_cast<int>(img.width), ih);
+						if (!m.empty())
+							dets.push_back(m);
+					}
+				}
+				continue;
+			}
+			crops.push_back(crop(img, Rect{0, b.y, static_cast<int>(img.width), b.h}));
+			todo_y.push_back(b.y);
+			// Rows this OCR pass reads with full context: the band minus half
+			// the overlap at internal edges (the neighbour covers those) and
+			// minus a full line height at the frame's top/bottom edge, where
+			// text can be cut off.
+			// (A slightly smaller margin than half the overlap avoids rounding gaps.)
+			const int half = std::max(0, edge_rows / 2 - 2);
+			const int v0 = y0 == 0 ? edge_rows : y0 + half;
+			const int v1 = y1 >= sh ? sh - edge_rows : y1 - half;
+			for (int y = std::max(0, v0); y < std::min(sh, v1); y++)
+				verified[static_cast<size_t>(y)] = 1;
 		}
+		for (const Image &c : crops)
+			todo.push_back(&c);
 
 		const std::vector<std::vector<OcrLine>> results = pool->run(todo);
 
 		size_t words = 0;
-		for (size_t k = 0; k < todo_idx.size(); k++) {
-			BandCache &c = cache[todo_idx[k]];
+		for (size_t k = 0; k < results.size(); k++) {
 			std::vector<OcrLine> lines = results[k];
 			for (OcrLine &l : lines) {
 				for (OcrWord &w : l.words)
-					w.box.y += c.band.y;
+					w.box.y += todo_y[k];
 				words += l.words.size();
 			}
-			c.rects.clear();
-			for (const Detection &d : matcher->match(lines)) {
-				Rect r = d.box.scaled(back_x, back_y)
-						 .padded(as.padding)
-						 .clipped(static_cast<int>(src_w), static_cast<int>(src_h));
-				if (!r.empty())
-					c.rects.push_back(r);
-			}
-			c.valid = true;
+			for (const Detection &d : matcher->match(lines))
+				dets.push_back(d.box);
 		}
+		dets = merge_rects(std::move(dets));
+		{
+			// Scroll speed for the edge guard, from this scan and the last.
+			const double scroll_full = scroll * sig_to_img * back_y;
+			const uint64_t frames = have_prev && job.seq > prev_seq ? job.seq - prev_seq : 0;
+			scroll_vy_ = frames ? scroll_full / static_cast<double>(frames) : 0.0;
+			scroll_seq_ = job.seq;
+			line_px_ = static_cast<int>(overlap * back_y);
+		}
+		prev_seq = job.seq;
+		prev_rects = dets;
+		prev_verified = std::move(verified);
+		prev_sig = std::move(sig);
+		prev_valid = true;
 
 		std::vector<Rect> rects;
-		for (const BandCache &c : cache)
-			rects.insert(rects.end(), c.rects.begin(), c.rects.end());
-		rects = merge_rects(std::move(rects));
+		for (const Rect &d : dets) {
+			Rect r = d.scaled(back_x, back_y)
+					 .padded(as.padding)
+					 .clipped(static_cast<int>(src_w), static_cast<int>(src_h));
+			if (!r.empty())
+				rects.push_back(r);
+		}
+		const std::vector<Band> &band_list = bands;
+		const size_t ocr_bands = todo.size();
 		const size_t redactions = rects.size();
 
+		const std::vector<Rect> debug_rects = rects;
 		MotionEvent ev;
 		ev.kind = MotionEvent::Kind::Scan;
 		ev.seq = job.seq;
@@ -531,17 +606,35 @@ void PiiRedactFilter::worker_main()
 			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 		// Total latency = time since the frame was captured (staging + OCR).
 		const double latency_ms = static_cast<double>(os_gettime_ns() - job.ts) / 1e6;
+		{
+			// Frames a scan lags behind (for sizing the edge guard).
+			obs_video_info ovi;
+			double fps = 30.0;
+			if (obs_get_video_info(&ovi) && ovi.fps_den)
+				fps = static_cast<double>(ovi.fps_num) / ovi.fps_den;
+			latency_frames_ = static_cast<uint64_t>(std::ceil(latency_ms * fps / 1000.0)) + 1;
+		}
 		avg_ms = avg_ms == 0.0 ? ms : avg_ms * 0.8 + ms * 0.2;
 		char buf[384];
-		snprintf(buf, sizeof(buf),
-			 "%s x%zu: scan %.0f ms (avg %.0f), latency %.0f ms | %zu/%zu bands re-read, %zu words | "
-			 "%zu redactions, %zu tracked | motion %.0f px/s",
-			 pool->engine_name().c_str(), pool->size(), ms, avg_ms, latency_ms, todo.size(), bands.size(),
-			 words, redactions, track_count_.load(), speed_px_s_.load());
+		snprintf(
+			buf, sizeof(buf),
+			"%s x%zu: scan %.0f ms (avg %.0f), latency %.0f ms | %zu/%zu bands re-read (scroll %d), %zu words | "
+			"%zu redactions, %zu tracked | motion %.0f px/s",
+			pool->engine_name().c_str(), pool->size(), ms, avg_ms, latency_ms, ocr_bands, band_list.size(),
+			scroll, words, redactions, track_count_.load(), speed_px_s_.load());
 		set_status(buf);
 		static const bool debug_log = getenv("OBS_PII_DEBUG") != nullptr;
-		if (debug_log)
-			obs_log(LOG_INFO, "scan seq=%llu %s", static_cast<unsigned long long>(job.seq), buf);
+		if (debug_log) {
+			std::string list;
+			for (const Rect &r : debug_rects)
+				list += " [" + std::to_string(r.x) + "," + std::to_string(r.y) + " " +
+					std::to_string(r.w) + "x" + std::to_string(r.h) + "]";
+			std::string ocr;
+			for (int y : todo_y)
+				ocr += " " + std::to_string(y);
+			obs_log(LOG_INFO, "scan seq=%llu %s | ocr bands at y:%s | rects:%s",
+				static_cast<unsigned long long>(job.seq), buf, ocr.c_str(), list.c_str());
+		}
 
 		worker_busy_ = false;
 	}
@@ -583,6 +676,7 @@ void PiiRedactFilter::motion_main()
 
 		MotionConfig cfg = tracker.config();
 		cfg.persist_ns = persist_ns_;
+		cfg.lookback_frames = static_cast<uint64_t>(delay_frames_.load()) + 2;
 		tracker.set_config(cfg);
 
 		for (MotionEvent &ev : batch) {
@@ -948,6 +1042,25 @@ void PiiRedactFilter::render()
 
 	draw_texture(tex, width, height);
 
+	// Edge guard: while the page scrolls, the strip new content enters
+	// through has not been read yet (and text there may be cut off). Cover
+	// it until a scan has seen it.
+	if (rs.edge_guard) {
+		const double vy = scroll_vy_;
+		if (std::fabs(vy) > 0.5) {
+			const uint64_t scan_seq = scroll_seq_;
+			const uint64_t since = out.seq > scan_seq ? out.seq - scan_seq : 0;
+			const double travel = std::fabs(vy) * static_cast<double>(since + latency_frames_.load());
+			const int strip = std::min(static_cast<int>(height),
+						   static_cast<int>(std::ceil(travel)) + line_px_.load() * 3 / 2);
+			if (vy < 0) // content moves up: new content enters at the bottom
+				regions.push_back(
+					{0, static_cast<int>(height) - strip, static_cast<int>(width), strip});
+			else
+				regions.push_back({0, 0, static_cast<int>(width), strip});
+		}
+	}
+
 	if (rs.debug)
 		draw_outlines(regions);
 	else if (rs.style == Style::Box)
@@ -1051,6 +1164,7 @@ obs_properties_t *PiiRedactFilter::properties()
 	obs_properties_t *safety = obs_properties_create();
 	p = obs_properties_add_int(safety, S_DELAY, obs_module_text("PIIRedact.DelayFrames"), 0, kMaxDelayFrames, 1);
 	obs_property_set_long_description(p, obs_module_text("PIIRedact.DelayFrames.Description"));
+	obs_properties_add_bool(safety, S_EDGE, obs_module_text("PIIRedact.EdgeGuard"));
 	obs_properties_add_bool(safety, S_FAILSAFE, obs_module_text("PIIRedact.FailSafe"));
 	obs_properties_add_bool(safety, S_DEBUG, obs_module_text("PIIRedact.Debug"));
 	obs_properties_add_group(props, "group_safety", obs_module_text("PIIRedact.Group.Safety"), OBS_GROUP_NORMAL,
@@ -1136,6 +1250,7 @@ void filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, S_DELAY, 0);
 	obs_data_set_default_bool(settings, S_FAILSAFE, false);
 	obs_data_set_default_bool(settings, S_DEBUG, false);
+	obs_data_set_default_bool(settings, S_EDGE, true);
 }
 
 } // namespace

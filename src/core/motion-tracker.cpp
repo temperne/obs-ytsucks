@@ -461,7 +461,13 @@ void MotionTracker::apply_scan(Scan scan)
 		} else {
 			Track t;
 			t.st.positions[seq] = d;
-			propagate_backward(t, seq, prev_scan_seq_);
+			uint64_t back_to = prev_scan_seq_;
+			const uint64_t newest = frames_.empty() ? seq : frames_.back().seq;
+			if (config_.lookback_frames && newest > config_.lookback_frames)
+				back_to = std::min(back_to, newest - config_.lookback_frames);
+			else if (config_.lookback_frames)
+				back_to = 0;
+			propagate_backward(t, seq, back_to);
 			propagate_forward(t, seq);
 			tracks_.push_back(std::move(t));
 			matched_track.push_back(true);

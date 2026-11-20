@@ -66,6 +66,10 @@ struct MotionConfig {
 	int context = 3;              // thumbnail pixels of context around each patch
 	double lost_threshold = 28.0; // mean abs grey difference per pixel
 	size_t history_frames = 300;
+	// New boxes are carried back at least this many frames (set to the
+	// output delay), so text that was not yet readable (e.g. still cut off
+	// at the edge while scrolling in) is covered on delayed frames too.
+	uint64_t lookback_frames = 0;
 };
 
 struct TrackState {
