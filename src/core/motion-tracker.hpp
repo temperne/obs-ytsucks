@@ -117,6 +117,10 @@ public:
 	// OCR found `rects` (full resolution) in frame `seq`. May arrive before
 	// that frame's thumbnail; it is then applied when the thumbnail comes.
 	void add_scan(uint64_t seq, std::vector<Rect> rects);
+	// Targeted scan: only `regions` (full resolution) of frame `seq` were
+	// read. Boxes inside them are re-anchored (or counted as missed); boxes
+	// elsewhere are left alone, and it does not count as a full scan.
+	void add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions);
 
 	// Snapshot holding positions for frames >= from_seq.
 	TrackerView view(uint64_t from_seq) const;
@@ -148,6 +152,8 @@ private:
 	struct Scan {
 		uint64_t seq;
 		std::vector<Rect> rects;
+		std::vector<Rect> regions; // non-empty for targeted scans
+		bool partial = false;
 	};
 
 	const Frame *frame_at(uint64_t seq) const;
@@ -174,6 +180,7 @@ private:
 	uint64_t newest_scan_seq_ = 0;
 	uint64_t prev_scan_seq_ = 0;
 	bool any_scan_ = false;
+	uint64_t newest_partial_seq_ = 0;
 	bool rescan_requested_ = false;
 	// Smoothed vertical velocity per strip, full-res px per video frame.
 	std::vector<double> strip_vy_;

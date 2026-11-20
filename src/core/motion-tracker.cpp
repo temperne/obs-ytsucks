@@ -293,25 +293,40 @@ std::vector<double> row_profile(const Image &img, int x0, int x1)
 	return p;
 }
 
+// Mean of the smallest `keep` fraction of `v` (robust to rows that do not
+// follow the motion, e.g. a fixed toolbar or taskbar inside a scrolling strip).
+double trimmed_mean(std::vector<double> &v, double keep)
+{
+	if (v.empty())
+		return std::numeric_limits<double>::infinity();
+	const size_t n = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(v.size()) * keep));
+	std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(n - 1), v.end());
+	double sum = 0;
+	for (size_t i = 0; i < n; i++)
+		sum += v[i];
+	return sum / static_cast<double>(n);
+}
+
 // Mean abs difference of columns [x0, x1) between cur(y) and prev(y - s),
 // sampled every 2nd pixel. +inf if fewer than half the rows overlap.
 double strip_mad(const Image &prev, const Image &cur, int x0, int x1, int s)
 {
 	const int h = static_cast<int>(cur.height);
-	uint64_t sum = 0, n = 0;
-	int rows = 0;
+	std::vector<double> rows;
 	for (int y = std::max(0, s); y < std::min(h, h + s); y += 2) {
 		const uint8_t *rc = cur.pixels.data() + static_cast<size_t>(y) * cur.width;
 		const uint8_t *rp = prev.pixels.data() + static_cast<size_t>(y - s) * prev.width;
+		uint64_t sum = 0, n = 0;
 		for (int x = x0; x < x1; x += 2) {
 			sum += static_cast<uint64_t>(std::abs(static_cast<int>(rc[x]) - static_cast<int>(rp[x])));
 			n++;
 		}
-		rows += 2;
+		if (n)
+			rows.push_back(static_cast<double>(sum) / static_cast<double>(n));
 	}
-	if (rows * 2 < h || !n)
+	if (static_cast<int>(rows.size()) * 4 < h)
 		return std::numeric_limits<double>::infinity();
-	return static_cast<double>(sum) / static_cast<double>(n);
+	return trimmed_mean(rows, 0.7);
 }
 
 } // namespace
@@ -351,14 +366,15 @@ void MotionTracker::measure_strips(const Frame &prev, Frame &cur)
 		// (almost) the whole range; the 1-D profile match makes this cheap.
 		const int radius = H / 2 + std::abs(pred);
 
+		std::vector<double> diffs;
 		auto profile_cost = [&](int sh) {
-			double sum = 0;
-			int n = 0;
-			for (int y = std::max(0, sh); y < std::min(H, H + sh); y++) {
-				sum += std::fabs(pb[static_cast<size_t>(y)] - pa[static_cast<size_t>(y - sh)]);
-				n++;
-			}
-			return n * 2 < H ? std::numeric_limits<double>::infinity() : sum / n;
+			diffs.clear();
+			for (int y = std::max(0, sh); y < std::min(H, H + sh); y++)
+				diffs.push_back(
+					std::fabs(pb[static_cast<size_t>(y)] - pa[static_cast<size_t>(y - sh)]));
+			if (static_cast<int>(diffs.size()) * 2 < H)
+				return std::numeric_limits<double>::infinity();
+			return trimmed_mean(diffs, 0.7);
 		};
 
 		int best = 0;
@@ -537,11 +553,22 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 
 void MotionTracker::add_scan(uint64_t seq, std::vector<Rect> rects)
 {
+	Scan sc{seq, std::move(rects), {}, false};
 	if (frames_.empty() || seq > frames_.back().seq) {
-		pending_scans_.push_back({seq, std::move(rects)});
+		pending_scans_.push_back(std::move(sc));
 		return;
 	}
-	apply_scan({seq, std::move(rects)});
+	apply_scan(std::move(sc));
+}
+
+void MotionTracker::add_partial_scan(uint64_t seq, std::vector<Rect> rects, std::vector<Rect> regions)
+{
+	Scan sc{seq, std::move(rects), std::move(regions), true};
+	if (frames_.empty() || seq > frames_.back().seq) {
+		pending_scans_.push_back(std::move(sc));
+		return;
+	}
+	apply_scan(std::move(sc));
 }
 
 void MotionTracker::apply_scan(Scan scan)
@@ -553,11 +580,29 @@ void MotionTracker::apply_scan(Scan scan)
 	const Frame *frame = frame_at(seq);
 	const uint64_t scan_ts = frame ? frame->ts : (frames_.empty() ? 0 : frames_.back().ts);
 
-	if (any_scan_ && scan.seq <= newest_scan_seq_)
-		return; // stale (older than a scan already applied)
-	prev_scan_seq_ = any_scan_ ? newest_scan_seq_ : (frames_.empty() ? seq : frames_.front().seq);
-	newest_scan_seq_ = scan.seq;
-	any_scan_ = true;
+	if (scan.partial) {
+		if (scan.seq <= newest_partial_seq_ || (any_scan_ && scan.seq <= newest_scan_seq_))
+			return; // stale
+		newest_partial_seq_ = scan.seq;
+	} else {
+		if (any_scan_ && scan.seq <= newest_scan_seq_)
+			return; // stale (older than a scan already applied)
+		prev_scan_seq_ = any_scan_ ? newest_scan_seq_ : (frames_.empty() ? seq : frames_.front().seq);
+		newest_scan_seq_ = scan.seq;
+		any_scan_ = true;
+	}
+	auto in_regions = [&](const Rect &r) {
+		for (const Rect &g : scan.regions)
+			if (g.intersects(r))
+				return true;
+		return false;
+	};
+	auto region_of = [&](const Rect &r) -> int {
+		for (size_t i = 0; i < scan.regions.size(); i++)
+			if (scan.regions[i].intersects(r))
+				return static_cast<int>(i);
+		return -1;
+	};
 
 	std::vector<Rect> dets = merge_rects(std::move(scan.rects));
 	std::vector<bool> matched_track(tracks_.size(), false);
@@ -576,6 +621,13 @@ void MotionTracker::apply_scan(Scan scan)
 			double score = iou(p, d);
 			if (score == 0.0 && p.intersects(d))
 				score = 0.01;
+			// Targeted scan: the box may have moved further than predicted
+			// but is still inside the window searched for it; take the
+			// nearest box predicted in the same window.
+			if (score == 0.0 && scan.partial && region_of(p) >= 0 && region_of(p) == region_of(d)) {
+				const double dy = std::fabs((p.y + p.h / 2.0) - (d.y + d.h / 2.0));
+				score = 0.005 / (1.0 + dy);
+			}
 			if (score > best_score) {
 				best_score = score;
 				best = static_cast<int>(i);
@@ -615,6 +667,13 @@ void MotionTracker::apply_scan(Scan scan)
 		Track &t = tracks_[i];
 		if (t.st.positions.empty() || t.st.positions.begin()->first > seq)
 			continue;
+		if (scan.partial) {
+			// Only boxes whose search window was read can be missed.
+			auto it = t.st.positions.upper_bound(seq);
+			--it;
+			if (!in_regions(it->second))
+				continue;
+		}
 		t.misses++;
 		if (t.misses > config_.tolerated_misses && !t.st.dead) {
 			t.st.dead = true;

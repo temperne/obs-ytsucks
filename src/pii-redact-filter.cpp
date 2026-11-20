@@ -109,7 +109,7 @@ constexpr const char *S_STATUS = "status";
 constexpr int kMaxDelayFrames = 120;
 constexpr uint32_t kThumbWidth = 768;
 // Motion sampling: every Nth frame while static, every Mth while moving.
-constexpr uint64_t kSampleEveryStatic = 3;
+constexpr uint64_t kSampleEveryStatic = 1;
 constexpr uint64_t kSampleEveryMoving = 1;
 constexpr size_t kThumbStages = 3;
 
@@ -200,7 +200,9 @@ struct MotionEvent {
 	Image thumb; // BGRA (Frame)
 	uint32_t full_w = 0;
 	uint32_t full_h = 0;
-	std::vector<Rect> rects; // (Scan)
+	std::vector<Rect> rects;   // (Scan)
+	std::vector<Rect> regions; // (Scan) targeted scan: the areas that were read
+	bool partial = false;
 };
 
 struct Job {
@@ -441,6 +443,8 @@ void PiiRedactFilter::worker_main()
 	uint64_t prev_seq = 0;
 	bool prev_valid = false;
 	double avg_ms = 0.0;
+	uint64_t last_full_ns = 0;
+	double last_full_ms = 0.0;
 
 	for (;;) {
 		Job job;
@@ -500,6 +504,105 @@ void PiiRedactFilter::worker_main()
 		}
 		const double back_x = static_cast<double>(src_w) / img.width;
 		const double back_y = static_cast<double>(src_h) / img.height;
+
+		// Targeted scan: between full scans, re-read only a window around
+		// every known box at its predicted position, at full resolution.
+		// Small crops take Tesseract a few tens of ms, so known PII is
+		// re-found at its exact position many times per second instead of
+		// relying on motion estimates. Full scans (below) find new PII.
+		{
+			std::shared_ptr<const TrackerView> view;
+			{
+				std::lock_guard<std::mutex> lock(view_mutex_);
+				view = view_;
+			}
+			std::vector<Rect> predicted;
+			if (view && prev_valid)
+				predicted = view->rects_for(job.seq, job.ts);
+			const double since_full_ms = static_cast<double>(os_gettime_ns() - last_full_ns) / 1e6;
+			if (!predicted.empty() && since_full_ms < std::max(300.0, 1.5 * last_full_ms)) {
+				// Search windows (full resolution): a few lines above and
+				// below, a little to the sides.
+				std::vector<Rect> regions;
+				for (const Rect &p : predicted) {
+					const int my = std::max(160, p.h * 4);
+					const Rect g = Rect{p.x - 80, p.y - my, p.w + 160, p.h + 2 * my}.clipped(
+						static_cast<int>(src_w), static_cast<int>(src_h));
+					if (!g.empty())
+						regions.push_back(g);
+				}
+				regions = merge_rects(std::move(regions));
+
+				std::vector<Image> rcrops;
+				std::vector<Rect> rimg;
+				for (const Rect &g : regions) {
+					const Rect gi = g.scaled(1.0 / back_x, 1.0 / back_y)
+								.clipped(static_cast<int>(img.width),
+									 static_cast<int>(img.height));
+					if (gi.empty())
+						continue;
+					rcrops.push_back(crop(img, gi));
+					rimg.push_back(gi);
+				}
+				std::vector<const Image *> rtasks;
+				for (const Image &c : rcrops)
+					rtasks.push_back(&c);
+				const std::vector<std::vector<OcrLine>> rres = pool->run(rtasks);
+
+				std::vector<Rect> found;
+				size_t twords = 0;
+				for (size_t k = 0; k < rres.size(); k++) {
+					std::vector<OcrLine> lines = rres[k];
+					for (OcrLine &l : lines) {
+						for (OcrWord &w : l.words) {
+							w.box.x += rimg[k].x;
+							w.box.y += rimg[k].y;
+						}
+						twords += l.words.size();
+					}
+					for (const Detection &d : matcher->match(lines)) {
+						const Rect r = d.box.scaled(back_x, back_y)
+								       .padded(as.padding)
+								       .clipped(static_cast<int>(src_w),
+										static_cast<int>(src_h));
+						if (!r.empty())
+							found.push_back(r);
+					}
+				}
+				const size_t nfound = found.size();
+				std::string dbg;
+				for (const Rect &r : found)
+					dbg += " [" + std::to_string(r.x) + "," + std::to_string(r.y) + " " +
+					       std::to_string(r.w) + "x" + std::to_string(r.h) + "]";
+
+				MotionEvent pev;
+				pev.kind = MotionEvent::Kind::Scan;
+				pev.partial = true;
+				pev.seq = job.seq;
+				pev.ts = job.ts;
+				pev.rects = std::move(found);
+				pev.regions = regions;
+				post_motion(std::move(pev));
+
+				const double ms =
+					std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+						.count();
+				char buf[384];
+				snprintf(
+					buf, sizeof(buf),
+					"%s x%zu: targeted scan %.0f ms (%zu areas, %zu words, %zu found) | last full scan "
+					"%.0f ms | %zu tracked | motion %.0f px/s",
+					pool->engine_name().c_str(), pool->size(), ms, rimg.size(), twords, nfound,
+					last_full_ms, track_count_.load(), speed_px_s_.load());
+				set_status(buf);
+				static const bool tdebug = getenv("OBS_PII_DEBUG") != nullptr;
+				if (tdebug)
+					obs_log(LOG_INFO, "scan seq=%llu %s | rects:%s",
+						static_cast<unsigned long long>(job.seq), buf, dbg.c_str());
+				worker_busy_ = false;
+				continue;
+			}
+		}
 
 		// Small overlapping bands (several per OCR thread). The overlap must
 		// exceed the tallest line of text we want to catch whole.
@@ -687,6 +790,8 @@ void PiiRedactFilter::worker_main()
 		// Total latency = time since the frame was captured (staging + OCR).
 		const double latency_ms = static_cast<double>(os_gettime_ns() - job.ts) / 1e6;
 		avg_ms = avg_ms == 0.0 ? ms : avg_ms * 0.8 + ms * 0.2;
+		last_full_ns = os_gettime_ns();
+		last_full_ms = ms;
 		char buf[384];
 		snprintf(
 			buf, sizeof(buf),
@@ -764,7 +869,10 @@ void PiiRedactFilter::motion_main()
 				last_ts = ev.ts;
 				last_seq = ev.seq;
 			} else {
-				tracker.add_scan(ev.seq, std::move(ev.rects));
+				if (ev.partial)
+					tracker.add_partial_scan(ev.seq, std::move(ev.rects), std::move(ev.regions));
+				else
+					tracker.add_scan(ev.seq, std::move(ev.rects));
 			}
 		}
 
