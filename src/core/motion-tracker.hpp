@@ -20,6 +20,15 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 // Keeps redaction boxes glued to the content between OCR scans.
 //
+// Motion is measured per vertical *strip* of the frame, not per box: each
+// strip's scroll offset between two samples is found by matching full-height
+// row profiles (headings, paragraph gaps and images make these unambiguous,
+// unlike a single line of text which looks like its neighbours). Every box
+// in a strip then moves by the same amount, so boxes move together with the
+// page and cannot wander off on their own. Per box we only choose between
+// a few candidate offsets (its strip's, its neighbours', or zero for fixed
+// content such as toolbars), which cannot alias onto another text line.
+//
 // OCR is much slower than the frame rate, and when a page scrolls a box
 // placed where the text *was* stops covering it. The tracker receives a
 // small grey thumbnail of *some* frames (the filter samples a few times per
@@ -126,6 +135,11 @@ private:
 		uint64_t seq;
 		uint64_t ts;
 		Image grey;
+		// Vertical content shift of each strip relative to the previous
+		// sample, in thumbnail rows (content at y came from y - shift), and
+		// whether that strip's motion could be confirmed.
+		std::vector<int> shift;
+		std::vector<uint8_t> ok;
 	};
 	struct Track {
 		TrackState st;
@@ -141,6 +155,8 @@ private:
 	// Move a track's box from frame `from` to frame `to` (adjacent in either
 	// direction). Returns false when the content was lost.
 	bool step(Track &t, const Frame &from, const Frame &to, bool forward);
+	void measure_strips(const Frame &prev, Frame &cur);
+	int strip_of(const Rect &full_rect) const;
 	void propagate_forward(Track &t, uint64_t from_seq);
 	void propagate_backward(Track &t, uint64_t from_seq, uint64_t to_seq);
 	void prune();
@@ -159,6 +175,8 @@ private:
 	uint64_t prev_scan_seq_ = 0;
 	bool any_scan_ = false;
 	bool rescan_requested_ = false;
+	// Smoothed vertical velocity per strip, full-res px per video frame.
+	std::vector<double> strip_vy_;
 };
 
 // Block matching, exposed for tests. Finds (dx, dy) minimising the mean

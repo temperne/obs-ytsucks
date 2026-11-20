@@ -105,7 +105,7 @@ constexpr const char *S_EDGE = "edge_guard";
 constexpr const char *S_STATUS = "status";
 
 constexpr int kMaxDelayFrames = 120;
-constexpr uint32_t kThumbWidth = 512;
+constexpr uint32_t kThumbWidth = 768;
 // Motion sampling: every Nth frame while static, every Mth while moving.
 constexpr uint64_t kSampleEveryStatic = 6;
 constexpr uint64_t kSampleEveryMoving = 2;

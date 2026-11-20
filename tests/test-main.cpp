@@ -95,6 +95,9 @@ static void test_detectors()
 	CHECK(has_kind(m, "123 Main Street, Apt 4B", PiiKind::StreetAddress));
 	CHECK(has_kind(m, "PO Box 1234", PiiKind::StreetAddress));
 	CHECK(has_kind(m, "Springfield, IL 62704", PiiKind::StreetAddress));
+	CHECK(has_kind(m, "Tucson, Arizona 85705", PiiKind::StreetAddress));
+	CHECK(has_kind(m, "919 N. Stone Ave., Apt. #5305", PiiKind::StreetAddress));
+	CHECK(has_kind(m, "402-598-1285", PiiKind::Phone));
 	CHECK(has_kind(m, "DOB: 01/02/1990", PiiKind::DateOfBirth));
 	CHECK(has_kind(m, "Date of birth March 3, 1985", PiiKind::DateOfBirth));
 	CHECK(has_kind(m, "key AKIAIOSFODNN7EXAMPLE", PiiKind::Secret));

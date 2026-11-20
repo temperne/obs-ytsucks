@@ -275,6 +275,130 @@ Rect MotionTracker::to_thumb(const Rect &r) const
 	return r.scaled(sx_, sy_);
 }
 
+namespace {
+
+constexpr int kStrips = 8;
+
+// Mean of each row of `img` between columns [x0, x1).
+std::vector<double> row_profile(const Image &img, int x0, int x1)
+{
+	std::vector<double> p(img.height);
+	for (uint32_t y = 0; y < img.height; y++) {
+		const uint8_t *row = img.pixels.data() + static_cast<size_t>(y) * img.width;
+		uint32_t sum = 0;
+		for (int x = x0; x < x1; x++)
+			sum += row[x];
+		p[y] = static_cast<double>(sum) / std::max(1, x1 - x0);
+	}
+	return p;
+}
+
+// Mean abs difference of columns [x0, x1) between cur(y) and prev(y - s),
+// sampled every 2nd pixel. +inf if fewer than half the rows overlap.
+double strip_mad(const Image &prev, const Image &cur, int x0, int x1, int s)
+{
+	const int h = static_cast<int>(cur.height);
+	uint64_t sum = 0, n = 0;
+	int rows = 0;
+	for (int y = std::max(0, s); y < std::min(h, h + s); y += 2) {
+		const uint8_t *rc = cur.pixels.data() + static_cast<size_t>(y) * cur.width;
+		const uint8_t *rp = prev.pixels.data() + static_cast<size_t>(y - s) * prev.width;
+		for (int x = x0; x < x1; x += 2) {
+			sum += static_cast<uint64_t>(std::abs(static_cast<int>(rc[x]) - static_cast<int>(rp[x])));
+			n++;
+		}
+		rows += 2;
+	}
+	if (rows * 2 < h || !n)
+		return std::numeric_limits<double>::infinity();
+	return static_cast<double>(sum) / static_cast<double>(n);
+}
+
+} // namespace
+
+void MotionTracker::measure_strips(const Frame &prev, Frame &cur)
+{
+	const int W = static_cast<int>(cur.grey.width);
+	const int H = static_cast<int>(cur.grey.height);
+	cur.shift.assign(kStrips, 0);
+	cur.ok.assign(kStrips, 1);
+	if (strip_vy_.size() != kStrips)
+		strip_vy_.assign(kStrips, 0.0);
+	const double gap = static_cast<double>(cur.seq - prev.seq);
+	constexpr double kGood = 3.0;
+
+	for (int k = 0; k < kStrips; k++) {
+		const int x0 = k * W / kStrips;
+		const int x1 = (k + 1) * W / kStrips;
+		const std::vector<double> pa = row_profile(prev.grey, x0, x1);
+		const std::vector<double> pb = row_profile(cur.grey, x0, x1);
+
+		// Blank strip: nothing to track.
+		double mean = 0;
+		for (double v : pb)
+			mean += v;
+		mean /= std::max(1, H);
+		double dev = 0;
+		for (double v : pb)
+			dev += std::fabs(v - mean);
+		if (dev / std::max(1, H) < 0.5) {
+			strip_vy_[k] *= 0.5;
+			continue;
+		}
+
+		const int pred = static_cast<int>(std::lround(strip_vy_[k] * gap * sy_));
+		const int radius = std::min(H / 3, std::max(12, std::abs(pred) / 2 + 8 * static_cast<int>(gap)));
+
+		auto profile_cost = [&](int sh) {
+			double sum = 0;
+			int n = 0;
+			for (int y = std::max(0, sh); y < std::min(H, H + sh); y++) {
+				sum += std::fabs(pb[static_cast<size_t>(y)] - pa[static_cast<size_t>(y - sh)]);
+				n++;
+			}
+			return n * 2 < H ? std::numeric_limits<double>::infinity() : sum / n;
+		};
+
+		int best = 0;
+		double best_cost = profile_cost(0);
+		for (int sh = pred - radius; sh <= pred + radius; sh++) {
+			const double c = profile_cost(sh) + 0.002 * std::abs(sh - pred);
+			if (c < best_cost) {
+				best_cost = c;
+				best = sh;
+			}
+		}
+
+		// Confirm in 2-D; fall back to "not moving" or "unknown".
+		const double mad_best = strip_mad(prev.grey, cur.grey, x0, x1, best);
+		const double mad_zero = best == 0 ? mad_best : strip_mad(prev.grey, cur.grey, x0, x1, 0);
+		int shift = 0;
+		bool ok = true;
+		if (mad_best <= kGood || mad_best < 0.6 * mad_zero)
+			shift = best;
+		else if (mad_zero <= kGood)
+			shift = 0;
+		else
+			ok = false; // content changed, not just moved
+
+		cur.shift[static_cast<size_t>(k)] = shift;
+		cur.ok[static_cast<size_t>(k)] = ok ? 1 : 0;
+		if (ok && gap > 0) {
+			const double v = shift / sy_ / gap;
+			strip_vy_[static_cast<size_t>(k)] = 0.5 * strip_vy_[static_cast<size_t>(k)] + 0.5 * v;
+		}
+	}
+}
+
+int MotionTracker::strip_of(const Rect &r) const
+{
+	if (frames_.empty())
+		return 0;
+	const double W = frames_.back().grey.width;
+	const double cx = (r.x + r.w / 2.0) * sx_;
+	return std::clamp(static_cast<int>(cx * kStrips / W), 0, kStrips - 1);
+}
+
 bool MotionTracker::step(Track &t, const Frame &from, const Frame &to, bool forward)
 {
 	auto it = t.st.positions.find(from.seq);
@@ -282,56 +406,63 @@ bool MotionTracker::step(Track &t, const Frame &from, const Frame &to, bool forw
 		return true;
 	const Rect cur = it->second;
 
-	// Frames are sampled sparsely; `gap` is how many video frames apart
-	// these two samples are. Velocity is kept per video frame.
-	const double gap = static_cast<double>(forward ? to.seq - from.seq : from.seq - to.seq);
-	const double dir = forward ? gap : -gap;
-	const int pdx = static_cast<int>(std::lround(dir * t.st.vx * sx_));
-	const int pdy = static_cast<int>(std::lround(dir * t.st.vy * sy_));
-	const int radius =
-		std::min(config_.search_radius * static_cast<int>(std::max(1.0, gap)), config_.max_search_radius);
+	// Shifts are stored on the later frame of each pair.
+	const Frame &later = forward ? to : from;
+	if (later.shift.size() != kStrips) {
+		t.st.positions[to.seq] = cur;
+		return true;
+	}
+	const int k = strip_of(cur);
+	const int sign = forward ? 1 : -1;
 
-	const Rect patch = to_thumb(cur).padded(config_.context);
-	int dx = 0, dy = 0;
-	double err = 0.0;
-	match_patch(from.grey, to.grey, patch, pdx, pdy, radius, dx, dy, err);
+	// Candidates: this strip's motion, its neighbours' (a box can straddle
+	// strips) and zero (fixed content inside a scrolling strip).
+	std::vector<int> cands;
+	for (int d : {0, -1, 1}) {
+		const int kk = k + d;
+		if (kk < 0 || kk >= kStrips || !later.ok[static_cast<size_t>(kk)])
+			continue;
+		cands.push_back(sign * later.shift[static_cast<size_t>(kk)]);
+	}
+	cands.push_back(0);
+
+	const Rect patch = to_thumb(cur)
+				   .padded(config_.context)
+				   .clipped(static_cast<int>(from.grey.width), static_cast<int>(from.grey.height));
+	int best = 0;
+	double best_sad = std::numeric_limits<double>::infinity();
+	for (int dy : cands) {
+		const double sad = patch_sad(from.grey, to.grey, patch, 0, dy);
+		if (sad < best_sad - 0.25) {
+			best_sad = sad;
+			best = dy;
+		}
+	}
 
 	bool ok = true;
-	if (err > config_.lost_threshold) {
-		// Content under the box changed; do not guess, keep the box put.
-		dx = dy = 0;
-		ok = false;
+	if (std::isinf(best_sad)) {
+		// Patch (partly) left the frame: trust the strip's motion.
+		best = later.ok[static_cast<size_t>(k)] ? sign * later.shift[static_cast<size_t>(k)] : 0;
+	} else if (best_sad > config_.lost_threshold) {
+		best = 0;
+		ok = false; // the text under the box changed
 	}
 
-	const double fdx = dx / sx_;
-	const double fdy = dy / sy_;
 	Rect next = cur;
-	next.x += static_cast<int>(std::lround(fdx));
-	next.y += static_cast<int>(std::lround(fdy));
+	next.y += static_cast<int>(std::lround(best / sy_));
 	t.st.positions[to.seq] = next;
-	if (forward && ok && gap > 0) {
-		t.st.vx = fdx / gap;
-		t.st.vy = fdy / gap;
-	}
 	return ok;
 }
 
 void MotionTracker::propagate_forward(Track &t, uint64_t from_seq)
 {
+	const Frame *prev = nullptr;
 	for (const Frame &f : frames_) {
-		if (f.seq <= from_seq)
-			continue;
-		auto prev = t.st.positions.upper_bound(f.seq - 1);
-		if (prev == t.st.positions.begin())
-			continue;
-		--prev;
-		const Frame *src = frame_at(prev->first);
-		if (!src) {
-			t.st.positions[f.seq] = prev->second;
-			continue;
+		if (f.seq > from_seq && prev && t.st.positions.count(prev->seq)) {
+			if (!step(t, *prev, f, true))
+				rescan_requested_ = true;
 		}
-		if (!step(t, *src, f, true))
-			rescan_requested_ = true;
+		prev = &f;
 	}
 }
 
@@ -355,8 +486,6 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 {
 	if (grey.empty() || grey.channels != 1 || full_w == 0 || full_h == 0)
 		return;
-	const double sx = static_cast<double>(grey.width) / full_w;
-	const double sy = static_cast<double>(grey.height) / full_h;
 	if (full_w != full_w_ || full_h != full_h_ ||
 	    (!frames_.empty() &&
 	     (frames_.back().grey.width != grey.width || frames_.back().grey.height != grey.height))) {
@@ -364,13 +493,16 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 		full_w_ = full_w;
 		full_h_ = full_h;
 	}
-	sx_ = sx;
-	sy_ = sy;
+	sx_ = static_cast<double>(grey.width) / full_w;
+	sy_ = static_cast<double>(grey.height) / full_h;
 	if (!frames_.empty() && seq <= frames_.back().seq)
 		return; // out of order, ignore
 
-	frames_.push_back({seq, ts, std::move(grey)});
-	const Frame &f = frames_.back();
+	Frame f{seq, ts, std::move(grey), {}, {}};
+	if (!frames_.empty())
+		measure_strips(frames_.back(), f);
+	frames_.push_back(std::move(f));
+	const Frame &cur = frames_.back();
 	const Frame *prev = frames_.size() > 1 ? &frames_[frames_.size() - 2] : nullptr;
 
 	for (Track &t : tracks_) {
@@ -380,7 +512,7 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 		if (last->first >= seq)
 			continue;
 		if (prev && last->first == prev->seq) {
-			if (!step(t, *prev, f, true))
+			if (!step(t, *prev, cur, true))
 				rescan_requested_ = true;
 		} else {
 			t.st.positions[seq] = last->second;
@@ -391,11 +523,11 @@ void MotionTracker::add_frame(uint64_t seq, uint64_t ts, Image grey, uint32_t fu
 	if (!pending_scans_.empty()) {
 		std::vector<Scan> ready;
 		std::vector<Scan> waiting;
-		for (Scan &s : pending_scans_)
-			(s.seq <= seq ? ready : waiting).push_back(std::move(s));
+		for (Scan &sc : pending_scans_)
+			(sc.seq <= seq ? ready : waiting).push_back(std::move(sc));
 		pending_scans_ = std::move(waiting);
-		for (Scan &s : ready)
-			apply_scan(std::move(s));
+		for (Scan &sc : ready)
+			apply_scan(std::move(sc));
 	}
 
 	prune();
@@ -523,9 +655,8 @@ void MotionTracker::prune()
 double MotionTracker::max_speed() const
 {
 	double m = 0.0;
-	for (const Track &t : tracks_)
-		if (!t.st.dead)
-			m = std::max(m, std::hypot(t.st.vx, t.st.vy));
+	for (double v : strip_vy_)
+		m = std::max(m, std::fabs(v));
 	return m;
 }
 
@@ -538,8 +669,11 @@ TrackerView MotionTracker::view(uint64_t from_seq) const
 	v.tracks.reserve(tracks_.size());
 	for (const Track &t : tracks_) {
 		TrackState s;
-		s.vx = t.st.vx;
-		s.vy = t.st.vy;
+		// Boxes extrapolate with their strip's (smoothed) scroll speed.
+		s.vx = 0.0;
+		s.vy = 0.0;
+		if (!t.st.positions.empty() && strip_vy_.size() == kStrips)
+			s.vy = strip_vy_[static_cast<size_t>(strip_of(t.st.positions.rbegin()->second))];
 		s.dead = t.st.dead;
 		s.dead_ts = t.st.dead_ts;
 		auto it = t.st.positions.lower_bound(from_seq);
