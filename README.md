@@ -54,8 +54,11 @@ or display capture), or to a nested scene to protect everything inside it.
 
 * **Redaction style.** *Solid box* is the default and the only safe choice.
   Pixelation and blur of short text such as numbers can sometimes be reversed.
-* **Padding / Keep redaction after text disappears.** These grow boxes and
-  keep them up for a while, which hides OCR jitter and scrolling.
+* **Box lifetime.** Once something is detected, its box stays up until
+  scans confirm the text is gone: two scans in a row must not see it, so
+  one OCR miss can't uncover it. Slow scans never make a box blink off.
+  *Extra time to keep a box* adds a margin after that, and *Padding* grows
+  each box.
 * **Minimum time between scans, OCR resolution scale.** Trade CPU for speed.
   A scale of 0.5 is about 4× faster but misses small text.
 * **Delay video by N frames (leak protection).** OCR takes time (tens of ms

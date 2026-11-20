@@ -39,11 +39,23 @@ void RegionTracker::add_result(uint64_t frame_seq, uint64_t frame_ts_ns, std::ve
 
 std::vector<Rect> RegionTracker::regions_for(uint64_t frame_ts_ns) const
 {
-	const uint64_t from = frame_ts_ns > persist_ns_ ? frame_ts_ns - persist_ns_ : 0;
 	std::vector<Rect> out;
-	for (const Result &r : results_) {
-		if (r.ts < from)
+	const size_t n = results_.size();
+	for (size_t i = 0; i < n; i++) {
+		const Result &r = results_[i];
+		if (r.regions.empty())
 			continue;
+
+		uint64_t start = r.ts > persist_ns_ ? r.ts - persist_ns_ : 0;
+		if (i > 0)
+			start = std::min(start, results_[i - 1].ts);
+		if (frame_ts_ns < start)
+			continue;
+
+		const size_t expiry_scan = i + 1 + misses_;
+		if (expiry_scan < n && frame_ts_ns > results_[expiry_scan].ts + persist_ns_)
+			continue;
+
 		out.insert(out.end(), r.regions.begin(), r.regions.end());
 	}
 	return merge_rects(std::move(out));
@@ -56,8 +68,12 @@ bool RegionTracker::verified(uint64_t frame_seq) const
 
 void RegionTracker::prune(uint64_t oldest_needed_ts_ns)
 {
-	const uint64_t keep_from = oldest_needed_ts_ns > persist_ns_ ? oldest_needed_ts_ns - persist_ns_ : 0;
-	while (!results_.empty() && results_.front().ts < keep_from)
+	// The front result is dead once its expiry scan is older than the oldest
+	// frame we may still output. Keep one extra result as the "previous scan"
+	// that bounds the look-ahead of its successor.
+	const size_t expiry_offset = 1 + misses_;
+	while (results_.size() > expiry_offset + 1 && results_[expiry_offset].ts + persist_ns_ < oldest_needed_ts_ns &&
+	       results_[1].ts < oldest_needed_ts_ns)
 		results_.pop_front();
 }
 

@@ -17,7 +17,7 @@ trap 'rm -rf "$work"' EXIT
 
 g++ -std=c++17 -O1 -I/usr/include/obs "$here/obs-e2e.cpp" -o "$work/obs-e2e" -lobs -lX11
 HOME="$work" timeout 90 xvfb-run -a "$work/obs-e2e" "$build/obs-ytsucks.so" "$repo/data" \
-  "$here/pii-sample.png" "$work/out.raw" 8
+  "$here/pii-sample.png" "$work/out.raw" 8 | tee "$work/log.txt"
 convert -size 1280x720 -depth 8 "bgra:$work/out.raw" -alpha off "$build/e2e-output.png"
 
 # Mean brightness (0..1) of a crop; PII crops must be ~black, the benign line must not be.
@@ -32,5 +32,13 @@ if [[ "${STYLE:-0}" == 0 ]]; then
   check_dark 380x30+200+575 card
 fi
 check_light 600x40+80+115 benign
+
+# Once redacted, the box must never drop out again (no blinking between scans).
+if [[ "${STYLE:-0}" == 0 ]]; then
+  line=$(grep 'first redacted frame' "$work/log.txt")
+  echo "$line"
+  [[ "$line" =~ unredacted\ frames\ after\ that:\ 0$ ]] || { echo "  FAIL: redaction flickered"; fail=1; }
+  [[ "$line" =~ first\ redacted\ frame:\ -1 ]] && { echo "  FAIL: never redacted"; fail=1; }
+fi
 echo "output: $build/e2e-output.png"
 exit $fail

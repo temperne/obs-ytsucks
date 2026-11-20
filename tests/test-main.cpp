@@ -174,24 +174,77 @@ static void test_rects()
 static void test_tracker()
 {
 	const uint64_t ms = 1000000ULL;
-	RegionTracker t;
-	t.set_persistence_ns(500 * ms);
-	CHECK(!t.verified(1));
-	t.add_result(10, 1000 * ms, {Rect{0, 0, 10, 10}});
-	CHECK(t.verified(10));
-	CHECK(t.verified(5));
-	CHECK(!t.verified(11));
-	// A frame captured before the analysed frame is covered (look-ahead)...
-	CHECK(t.regions_for(900 * ms).size() == 1);
-	// ...and so is a frame within the persistence window after it...
-	CHECK(t.regions_for(1400 * ms).size() == 1);
-	// ...but not one after the window.
-	CHECK(t.regions_for(1600 * ms).empty());
-	t.add_result(20, 2000 * ms, {Rect{50, 50, 10, 10}});
-	t.prune(1600 * ms);
-	CHECK(t.result_count() == 1);
-	t.clear();
-	CHECK(t.result_count() == 0 && !t.verified(0));
+	const Rect A{0, 0, 10, 10};
+	const Rect B{50, 50, 10, 10};
+
+	{
+		RegionTracker t;
+		t.set_persistence_ns(500 * ms);
+		CHECK(!t.verified(1));
+		t.add_result(10, 1000 * ms, {A});
+		CHECK(t.verified(10));
+		CHECK(t.verified(5));
+		CHECK(!t.verified(11));
+		// Look-ahead: a frame captured shortly before the scanned frame.
+		CHECK(t.regions_for(900 * ms).size() == 1);
+		// Regression (blinking): with no newer scan the box must stay up,
+		// however long the next scan takes.
+		CHECK(t.regions_for(1400 * ms).size() == 1);
+		CHECK(t.regions_for(9000 * ms).size() == 1);
+	}
+
+	{
+		// Slow scans (2 s each) with persist far shorter than the scan time:
+		// text visible in every scan must be covered continuously.
+		RegionTracker t;
+		t.set_persistence_ns(100 * ms);
+		t.add_result(1, 1000 * ms, {A});
+		t.add_result(2, 3000 * ms, {A});
+		t.add_result(3, 5000 * ms, {A});
+		for (uint64_t f = 1000; f <= 8000; f += 50)
+			CHECK(t.regions_for(f * ms).size() == 1);
+	}
+
+	{
+		// Text disappears: hold through one missed scan (default), then
+		// expire `persist` after the second scan that did not see it.
+		RegionTracker t;
+		t.set_persistence_ns(500 * ms);
+		t.add_result(1, 1000 * ms, {A});
+		t.add_result(2, 2000 * ms, {});
+		CHECK(t.regions_for(2500 * ms).size() == 1); // one miss tolerated
+		t.add_result(3, 3000 * ms, {});
+		CHECK(t.regions_for(3400 * ms).size() == 1);
+		CHECK(t.regions_for(3600 * ms).empty());
+
+		t.set_tolerated_misses(0);
+		CHECK(t.regions_for(2400 * ms).size() == 1);
+		CHECK(t.regions_for(2600 * ms).empty());
+	}
+
+	{
+		// Look-back to the previous scan: text first seen at 2000 was not
+		// there at 1000, so (delayed) frames after 1000 are covered.
+		RegionTracker t;
+		t.set_persistence_ns(200 * ms);
+		t.add_result(1, 1000 * ms, {});
+		t.add_result(2, 2000 * ms, {B});
+		CHECK(t.regions_for(900 * ms).empty());
+		CHECK(t.regions_for(1200 * ms).size() == 1);
+	}
+
+	{
+		RegionTracker t;
+		t.set_persistence_ns(100 * ms);
+		for (uint64_t i = 1; i <= 10; i++)
+			t.add_result(i, i * 1000 * ms, {A});
+		t.prune(9000 * ms);
+		CHECK(t.result_count() < 10);
+		CHECK(t.regions_for(9000 * ms).size() == 1);
+		CHECK(t.regions_for(10000 * ms).size() == 1);
+		t.clear();
+		CHECK(t.result_count() == 0 && !t.verified(0));
+	}
 }
 
 static void test_image()

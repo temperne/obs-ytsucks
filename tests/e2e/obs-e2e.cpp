@@ -15,13 +15,25 @@ static std::mutex g_mtx;
 static std::vector<uint8_t> g_frame;
 static uint32_t g_linesize = 0;
 static std::atomic<int> g_frames{0};
+// Per-frame flicker tracking of the e-mail area (x 300..700, y 275..305).
+static int g_first_redacted = -1;
+static int g_flicker_frames = 0;
 
 static void raw_cb(void *, struct video_data *frame)
 {
 	std::lock_guard<std::mutex> l(g_mtx);
 	g_linesize = frame->linesize[0];
 	g_frame.assign(frame->data[0], frame->data[0] + (size_t)g_linesize * 720);
-	g_frames++;
+	double sum = 0;
+	for (int y = 275; y < 305; y++)
+		for (int x = 300; x < 700; x++)
+			sum += frame->data[0][(size_t)y * g_linesize + x * 4 + 1];
+	const bool dark = sum / (30.0 * 400.0) < 25.0;
+	const int n = g_frames++;
+	if (dark && g_first_redacted < 0)
+		g_first_redacted = n;
+	else if (!dark && g_first_redacted >= 0)
+		g_flicker_frames++;
 }
 
 static bool load(const char *bin, const char *data)
@@ -87,6 +99,10 @@ int main(int argc, char **argv)
 		obs_data_set_int(fs, "style", atoi(getenv("STYLE")));
 	if (getenv("DELAY"))
 		obs_data_set_int(fs, "delay_frames", atoi(getenv("DELAY")));
+	if (getenv("PERSIST"))
+		obs_data_set_int(fs, "persist_ms", atoi(getenv("PERSIST")));
+	if (getenv("INTERVAL"))
+		obs_data_set_int(fs, "interval_ms", atoi(getenv("INTERVAL")));
 	if (getenv("FAILSAFE"))
 		obs_data_set_bool(fs, "fail_safe", true);
 	obs_source_t *filter = obs_source_create("pii_redact_filter", "pii", fs, nullptr);
@@ -117,6 +133,7 @@ int main(int argc, char **argv)
 		fclose(f);
 	}
 	printf("frames captured: %d\n", g_frames.load());
+	printf("first redacted frame: %d, unredacted frames after that: %d\n", g_first_redacted, g_flicker_frames);
 
 	obs_set_output_source(0, nullptr);
 	obs_source_release(filter);
