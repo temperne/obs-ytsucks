@@ -1,4 +1,10 @@
-cmake_minimum_required(VERSION 3.28...3.30)
+# Linux builds work with the CMake shipped by Debian 12 / Ubuntu 22.04+; the
+# Windows and macOS presets (from obs-plugintemplate) need 3.28.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
+  cmake_minimum_required(VERSION 3.25...3.30)
+else()
+  cmake_minimum_required(VERSION 3.28...3.30)
+endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
