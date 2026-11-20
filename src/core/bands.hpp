@@ -50,13 +50,16 @@ double mean_abs_diff(const Image &a, const Image &b, int step = 1);
 
 // Vertical scroll between two same-sized grey images: the shift s (rows)
 // such that cur(y) ~= prev(y - s), searched within +-max_shift using row
-// profiles. Positive s = content moved down.
-int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift);
+// profiles of columns [x0, x1) (x1 < 0 = full width). Positive s = content
+// moved down.
+int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift, int x0 = 0, int x1 = -1);
 
 // Mean absolute difference between rows [y0, y1) of `cur` and the same rows
-// of `prev` shifted by `shift` (cur(y) vs prev(y - shift)). Rows that come
+// of `prev` shifted by `shift` (cur(y) vs prev(y - shift)), columns
+// [x0, x1) only (x1 < 0 = full width). Rows that come
 // from outside `prev` count as "new". `new_fraction` receives the share of
 // such rows. Returns a large value on size mismatch.
-double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, int shift, double &new_fraction);
+double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, int shift, double &new_fraction,
+			 int x0 = 0, int x1 = -1);
 
 } // namespace pii

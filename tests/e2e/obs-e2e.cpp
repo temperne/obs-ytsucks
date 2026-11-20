@@ -1,5 +1,6 @@
 // Headless end-to-end test: real libobs + image source + our filter.
 #include <obs.h>
+#include <graphics/vec2.h>
 #include <obs-nix-platform.h>
 #include <X11/Xlib.h>
 #include <atomic>
@@ -150,8 +151,30 @@ int main(int argc, char **argv)
 		obs_source_filter_add(img, scroll);
 		obs_source_release(scroll);
 	}
-	obs_source_filter_add(img, filter);
-	obs_set_output_source(0, img);
+	obs_source_t *output = img;
+	obs_scene_t *scene = nullptr;
+	if (getenv("SPLIT")) {
+		// Like a desktop capture: the (scrolling) page on the left half and a
+		// static window full of non-PII text on the right half, one scene,
+		// PII filter on the whole scene.
+		obs_data_t *rs = obs_data_create();
+		obs_data_set_string(rs, "file", getenv("SPLIT"));
+		obs_source_t *right = obs_source_create("image_source", "right", rs, nullptr);
+		obs_data_release(rs);
+		scene = obs_scene_create("desk");
+		obs_sceneitem_t *li = obs_scene_add(scene, img);
+		struct obs_sceneitem_crop lc = {0, 0, 640, 0};
+		obs_sceneitem_set_crop(li, &lc);
+		obs_sceneitem_t *ri = obs_scene_add(scene, right);
+		struct obs_sceneitem_crop rc = {0, 0, 640, 0};
+		obs_sceneitem_set_crop(ri, &rc);
+		struct vec2 pos = {640.0f, 0.0f};
+		obs_sceneitem_set_pos(ri, &pos);
+		obs_source_release(right);
+		output = obs_scene_get_source(scene);
+	}
+	obs_source_filter_add(output, filter);
+	obs_set_output_source(0, output);
 
 	struct video_scale_info conv = {};
 	conv.format = VIDEO_FORMAT_BGRA;
@@ -198,6 +221,8 @@ int main(int argc, char **argv)
 	obs_set_output_source(0, nullptr);
 	obs_source_release(filter);
 	obs_source_release(img);
+	if (scene)
+		obs_scene_release(scene);
 	obs_shutdown();
 	XCloseDisplay(dpy);
 	return 0;

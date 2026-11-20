@@ -282,7 +282,10 @@ private:
 	std::atomic<size_t> track_count_{0};
 	// Page scroll measured by the scans (full-res px per video frame, + = down),
 	// the frame it was measured on, and a line height, for the edge guard.
-	std::atomic<double> scroll_vy_{0.0};
+	// Per column strip (same 8 strips as the scan): scroll speed, so the edge
+	// guard only covers columns that actually scroll.
+	std::mutex scroll_mutex_;
+	std::vector<double> col_vy_;
 	std::atomic<uint64_t> scroll_seq_{0};
 	std::atomic<int> line_px_{48};
 
@@ -490,8 +493,20 @@ void PiiRedactFilter::worker_main()
 		sig = resize(sig, std::max<uint32_t>(1, sig.width / 4), std::max<uint32_t>(1, sig.height / 4));
 		const double sig_to_img = static_cast<double>(ih) / sig.height;
 		const bool have_prev = prev_valid && prev_sig.width == sig.width && prev_sig.height == sig.height;
-		const int scroll = have_prev ? estimate_vertical_shift(prev_sig, sig, static_cast<int>(sig.height) / 2)
-					     : 0;
+		// Scroll is measured per column strip: the browser may scroll while
+		// the window next to it does not.
+		constexpr int kCols = 8;
+		const int sw = static_cast<int>(sig.width);
+		std::vector<int> col_shift(kCols, 0);
+		int scroll = 0; // largest column scroll, for the edge guard
+		if (have_prev) {
+			for (int k = 0; k < kCols; k++) {
+				col_shift[k] = estimate_vertical_shift(prev_sig, sig, static_cast<int>(sig.height) / 2,
+								       k * sw / kCols, (k + 1) * sw / kCols);
+				if (std::abs(col_shift[k]) > std::abs(scroll))
+					scroll = col_shift[k];
+			}
+		}
 
 		std::vector<Rect> dets; // scaled-image coordinates, unpadded
 		std::vector<Image> crops;
@@ -502,32 +517,46 @@ void PiiRedactFilter::worker_main()
 		std::vector<uint8_t> verified(static_cast<size_t>(sh), 0);
 		const int edge_rows = static_cast<int>(std::ceil(overlap / sig_to_img));
 		for (const Band &b : bands) {
-			bool reuse = false;
-			int shift = 0;
 			const int y0 = static_cast<int>(b.y / sig_to_img);
 			const int y1 = std::min(sh, static_cast<int>(std::ceil((b.y + b.h) / sig_to_img)));
-			if (have_prev) {
-				for (int cand : {scroll, 0}) {
+
+			// A band is only reused if *every* cell (band x column strip) is
+			// exactly the previous content, either unmoved or moved by its
+			// column's scroll, and was read with full context last time.
+			// Checking small cells (not a band-wide average) catches a few
+			// changed lines of text.
+			bool reuse = have_prev;
+			std::vector<int> cell_shift(kCols, 0);
+			for (int k = 0; reuse && k < kCols; k++) {
+				bool cell_ok = false;
+				for (int cand : {col_shift[k], 0}) {
 					double new_rows = 1.0;
-					const double diff = shifted_band_diff(prev_sig, sig, y0, y1, cand, new_rows);
+					const double diff = shifted_band_diff(prev_sig, sig, y0, y1, cand, new_rows,
+									      k * sw / kCols, (k + 1) * sw / kCols);
 					bool all_verified = new_rows == 0.0;
 					for (int y = y0; all_verified && y < y1; y++)
 						all_verified = prev_verified[static_cast<size_t>(y - cand)] != 0;
-					if (all_verified && diff < 2.0) {
-						reuse = true;
-						shift = static_cast<int>(std::lround(cand * sig_to_img));
-						for (int y = y0; y < y1; y++)
-							verified[static_cast<size_t>(y)] = 1;
+					if (all_verified && diff < 1.0) {
+						cell_ok = true;
+						cell_shift[k] = cand;
 						break;
 					}
 					if (cand == 0)
 						break;
 				}
+				reuse = cell_ok;
 			}
+
 			if (reuse) {
+				for (int y = y0; y < y1; y++)
+					verified[static_cast<size_t>(y)] = 1;
 				for (const Rect &r : prev_rects) {
+					const int cx = r.x + r.w / 2;
+					const int k =
+						std::clamp(static_cast<int>(cx / sig_to_img) * kCols / std::max(1, sw),
+							   0, kCols - 1);
 					Rect m = r;
-					m.y += shift;
+					m.y += static_cast<int>(std::lround(cell_shift[k] * sig_to_img));
 					const int cy = m.y + m.h / 2;
 					if (cy >= b.y && cy < b.y + b.h) {
 						m = m.clipped(static_cast<int>(img.width), ih);
@@ -569,9 +598,28 @@ void PiiRedactFilter::worker_main()
 		dets = merge_rects(std::move(dets));
 		{
 			// Scroll speed for the edge guard, from this scan and the last.
-			const double scroll_full = scroll * sig_to_img * back_y;
 			const uint64_t frames = have_prev && job.seq > prev_seq ? job.seq - prev_seq : 0;
-			scroll_vy_ = frames ? scroll_full / static_cast<double>(frames) : 0.0;
+			std::vector<double> cv(kCols, 0.0);
+			for (int k = 0; k < kCols && frames; k++)
+				cv[k] = col_shift[k] * sig_to_img * back_y / static_cast<double>(frames);
+			// A scrolling page is one contiguous region: columns between the
+			// outermost moving ones scroll too (a narrow column of repeating
+			// text lines can measure as unmoved), at the fastest speed seen.
+			int first = -1, last = -1;
+			double fastest = 0.0;
+			for (int k = 0; k < kCols; k++) {
+				if (std::fabs(cv[k]) > 0.5) {
+					if (first < 0)
+						first = k;
+					last = k;
+					if (std::fabs(cv[k]) > std::fabs(fastest))
+						fastest = cv[k];
+				}
+			}
+			for (int k = first; first >= 0 && k <= last; k++)
+				cv[k] = fastest;
+			std::lock_guard<std::mutex> lock(scroll_mutex_);
+			col_vy_ = std::move(cv);
 			scroll_seq_ = job.seq;
 			line_px_ = static_cast<int>(overlap * back_y);
 		}
@@ -1037,21 +1085,30 @@ void PiiRedactFilter::render()
 	// through has not been read yet (and text there may be cut off). Cover
 	// it until a scan has seen it.
 	if (rs.edge_guard) {
-		const double vy = scroll_vy_;
-		if (std::fabs(vy) > 0.5) {
-			const uint64_t scan_seq = scroll_seq_;
-			const uint64_t since = out.seq > scan_seq ? out.seq - scan_seq : 0;
+		std::vector<double> col_vy;
+		{
+			std::lock_guard<std::mutex> lock(scroll_mutex_);
+			col_vy = col_vy_;
+		}
+		const uint64_t scan_seq = scroll_seq_;
+		const uint64_t since = out.seq > scan_seq ? out.seq - scan_seq : 0;
+		const int cols = static_cast<int>(col_vy.size());
+		for (int k = 0; k < cols; k++) {
+			const double vy = col_vy[static_cast<size_t>(k)];
+			if (std::fabs(vy) <= 0.5)
+				continue;
 			// Content that entered since the scanned frame, plus about one
 			// line still cut off at the edge. `since` already includes the
 			// scan's latency (it counts from the frame that was scanned).
 			const double travel = std::fabs(vy) * static_cast<double>(since + 1);
 			const int strip = std::min(static_cast<int>(height) / 2,
 						   static_cast<int>(std::ceil(travel)) + line_px_.load() * 3 / 2);
+			const int x0 = k * static_cast<int>(width) / cols;
+			const int x1 = (k + 1) * static_cast<int>(width) / cols;
 			if (vy < 0) // content moves up: new content enters at the bottom
-				regions.push_back(
-					{0, static_cast<int>(height) - strip, static_cast<int>(width), strip});
+				regions.push_back({x0, static_cast<int>(height) - strip, x1 - x0, strip});
 			else
-				regions.push_back({0, 0, static_cast<int>(width), strip});
+				regions.push_back({x0, 0, x1 - x0, strip});
 		}
 	}
 

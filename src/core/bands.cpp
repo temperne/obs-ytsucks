@@ -99,19 +99,24 @@ double mean_abs_diff(const Image &a, const Image &b, int step)
 	return n ? static_cast<double>(sum) / static_cast<double>(n) : 0.0;
 }
 
-int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift)
+int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift, int x0, int x1)
 {
 	if (prev.width != cur.width || prev.height != cur.height || prev.channels != 1 || cur.channels != 1 ||
 	    cur.empty())
 		return 0;
 	const int h = static_cast<int>(cur.height);
-	const int w = static_cast<int>(cur.width);
+	if (x1 < 0 || x1 > static_cast<int>(cur.width))
+		x1 = static_cast<int>(cur.width);
+	x0 = std::max(0, x0);
+	if (x1 <= x0)
+		return 0;
+	const int w = x1 - x0;
 	auto profile = [&](const Image &img) {
 		std::vector<double> p(static_cast<size_t>(h));
 		for (int y = 0; y < h; y++) {
 			uint64_t sum = 0;
 			const uint8_t *row = img.pixels.data() + static_cast<size_t>(y) * img.width;
-			for (int x = 0; x < w; x++)
+			for (int x = x0; x < x1; x++)
 				sum += row[x];
 			p[static_cast<size_t>(y)] = static_cast<double>(sum) / w;
 		}
@@ -140,7 +145,8 @@ int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift)
 	return best;
 }
 
-double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, int shift, double &new_fraction)
+double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, int shift, double &new_fraction, int x0,
+			 int x1)
 {
 	new_fraction = 1.0;
 	if (prev.width != cur.width || prev.height != cur.height || prev.channels != 1 || cur.channels != 1)
@@ -149,6 +155,11 @@ double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, in
 	y0 = std::max(0, y0);
 	y1 = std::min(h, y1);
 	if (y1 <= y0)
+		return 1e9;
+	if (x1 < 0 || x1 > static_cast<int>(cur.width))
+		x1 = static_cast<int>(cur.width);
+	x0 = std::max(0, x0);
+	if (x1 <= x0)
 		return 1e9;
 	uint64_t sum = 0, n = 0;
 	int new_rows = 0;
@@ -160,9 +171,9 @@ double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, in
 		}
 		const uint8_t *rc = cur.pixels.data() + static_cast<size_t>(y) * cur.width;
 		const uint8_t *rp = prev.pixels.data() + static_cast<size_t>(py) * prev.width;
-		for (uint32_t x = 0; x < cur.width; x++)
+		for (int x = x0; x < x1; x++)
 			sum += static_cast<uint64_t>(std::abs(static_cast<int>(rc[x]) - static_cast<int>(rp[x])));
-		n += cur.width;
+		n += static_cast<uint64_t>(x1 - x0);
 	}
 	new_fraction = static_cast<double>(new_rows) / (y1 - y0);
 	return n ? static_cast<double>(sum) / static_cast<double>(n) : 1e9;
