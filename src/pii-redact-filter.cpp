@@ -285,7 +285,6 @@ private:
 	std::atomic<double> scroll_vy_{0.0};
 	std::atomic<uint64_t> scroll_seq_{0};
 	std::atomic<int> line_px_{48};
-	std::atomic<uint64_t> latency_frames_{2};
 
 	std::mutex view_mutex_;
 	std::shared_ptr<const TrackerView> view_;
@@ -606,14 +605,6 @@ void PiiRedactFilter::worker_main()
 			std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 		// Total latency = time since the frame was captured (staging + OCR).
 		const double latency_ms = static_cast<double>(os_gettime_ns() - job.ts) / 1e6;
-		{
-			// Frames a scan lags behind (for sizing the edge guard).
-			obs_video_info ovi;
-			double fps = 30.0;
-			if (obs_get_video_info(&ovi) && ovi.fps_den)
-				fps = static_cast<double>(ovi.fps_num) / ovi.fps_den;
-			latency_frames_ = static_cast<uint64_t>(std::ceil(latency_ms * fps / 1000.0)) + 1;
-		}
 		avg_ms = avg_ms == 0.0 ? ms : avg_ms * 0.8 + ms * 0.2;
 		char buf[384];
 		snprintf(
@@ -1050,8 +1041,11 @@ void PiiRedactFilter::render()
 		if (std::fabs(vy) > 0.5) {
 			const uint64_t scan_seq = scroll_seq_;
 			const uint64_t since = out.seq > scan_seq ? out.seq - scan_seq : 0;
-			const double travel = std::fabs(vy) * static_cast<double>(since + latency_frames_.load());
-			const int strip = std::min(static_cast<int>(height),
+			// Content that entered since the scanned frame, plus about one
+			// line still cut off at the edge. `since` already includes the
+			// scan's latency (it counts from the frame that was scanned).
+			const double travel = std::fabs(vy) * static_cast<double>(since + 1);
+			const int strip = std::min(static_cast<int>(height) / 2,
 						   static_cast<int>(std::ceil(travel)) + line_px_.load() * 3 / 2);
 			if (vy < 0) // content moves up: new content enters at the bottom
 				regions.push_back(

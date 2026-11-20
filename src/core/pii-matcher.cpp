@@ -262,7 +262,7 @@ PiiMatcher::PiiMatcher(const MatcherConfig &config) : min_confidence_(config.min
 
 	if (config.street_address) {
 		add(PiiKind::StreetAddress,
-		    R"(\d{1,6}(?:\s+[a-z0-9.'-]+){1,5}?\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|way|place|pl|terrace|ter|circle|cir|highway|hwy|parkway|pkwy|square|sq|trail|trl|crescent|cres|alley|aly)\b\.?(?:,?\s*(?:apt|apartment|suite|ste|unit|#)\.?\s*[a-z0-9-]+)?)",
+		    R"(\d{1,6}(?:\s+[a-z0-9.'-]+){1,5}?\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|way|place|pl|terrace|ter|circle|cir|highway|hwy|parkway|pkwy|square|sq|trail|trl|crescent|cres|alley|aly)\b\.?(?:,?\s*(?:apt|apartment|suite|ste|unit|#)\.?\s*#?\s*[a-z0-9-]+)?)",
 		    CI, false, Boundary::NoAdjacentAlnum, nullptr);
 		add(PiiKind::StreetAddress, R"(p\.?\s?o\.?\s+box\s+\d+)", CI, false, Boundary::NoAdjacentAlnum,
 		    nullptr);

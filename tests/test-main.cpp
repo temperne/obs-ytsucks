@@ -97,6 +97,14 @@ static void test_detectors()
 	CHECK(has_kind(m, "Springfield, IL 62704", PiiKind::StreetAddress));
 	CHECK(has_kind(m, "Tucson, Arizona 85705", PiiKind::StreetAddress));
 	CHECK(has_kind(m, "919 N. Stone Ave., Apt. #5305", PiiKind::StreetAddress));
+	{
+		// The unit number must be part of the match.
+		bool covers_unit = false;
+		for (const auto &sp : m.match_text("919 N. Stone Ave., Apt. #5305"))
+			if (sp.kind == PiiKind::StreetAddress && sp.end == 29)
+				covers_unit = true;
+		CHECK(covers_unit);
+	}
 	CHECK(has_kind(m, "402-598-1285", PiiKind::Phone));
 	CHECK(has_kind(m, "DOB: 01/02/1990", PiiKind::DateOfBirth));
 	CHECK(has_kind(m, "Date of birth March 3, 1985", PiiKind::DateOfBirth));

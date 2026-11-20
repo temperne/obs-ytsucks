@@ -128,6 +128,8 @@ int main(int argc, char **argv)
 		obs_data_set_int(fs, "persist_ms", atoi(getenv("PERSIST")));
 	if (getenv("INTERVAL"))
 		obs_data_set_int(fs, "interval_ms", atoi(getenv("INTERVAL")));
+	if (getenv("EDGE"))
+		obs_data_set_bool(fs, "edge_guard", atoi(getenv("EDGE")) != 0);
 	if (getenv("FAILSAFE"))
 		obs_data_set_bool(fs, "fail_safe", true);
 	obs_source_t *filter = obs_source_create("pii_redact_filter", "pii", fs, nullptr);
