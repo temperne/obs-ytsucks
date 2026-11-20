@@ -1,0 +1,79 @@
+// obs-ytsucks: redaction shaders.
+// Drawn with gs_draw_sprite_subregion(), so uv covers just the redacted
+// rectangle while sampling the full source texture.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 texel_size;  // 1 / texture size
+uniform float block_size;   // pixelate: block edge in pixels
+uniform float blur_radius;  // blur: radius in pixels
+
+sampler_state pointSampler {
+	Filter   = Point;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+sampler_state linearSampler {
+	Filter   = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
+}
+
+float4 PSPixelate(VertData v_in) : TARGET
+{
+	float2 block = texel_size * max(block_size, 1.0);
+	float2 uv = (floor(v_in.uv / block) + 0.5) * block;
+	// Average a 3x3 grid inside the block instead of a single texel so thin
+	// glyph strokes do not survive as isolated dark blocks.
+	float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+	for (int x = -1; x <= 1; x++) {
+		for (int y = -1; y <= 1; y++) {
+			sum += image.Sample(linearSampler, uv + float2(x, y) * block * 0.3);
+		}
+	}
+	return sum / 9.0;
+}
+
+float4 PSBlur(VertData v_in) : TARGET
+{
+	float2 step_uv = texel_size * (max(blur_radius, 1.0) / 4.0);
+	float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+	for (int x = -4; x <= 4; x++) {
+		for (int y = -4; y <= 4; y++) {
+			sum += image.Sample(linearSampler, v_in.uv + float2(x, y) * step_uv);
+		}
+	}
+	return sum / 81.0;
+}
+
+technique Pixelate
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSPixelate(v_in);
+	}
+}
+
+technique Blur
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSBlur(v_in);
+	}
+}
