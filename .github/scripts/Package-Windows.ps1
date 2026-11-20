@@ -67,6 +67,25 @@ function Package {
     }
     Compress-Archive -Force @CompressArgs
     Log-Group
+
+    Log-Group "Building installer for ${ProductName}..."
+    $Iscc = @(
+        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+        "${env:ProgramFiles}\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if ( ! $Iscc ) {
+        choco install innosetup --no-progress -y | Out-Host
+        $Iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+    }
+    $IsccArgs = @(
+        "/DAppVersion=${ProductVersion}"
+        "/DSourceDir=${ProjectRoot}\release\${Configuration}\${ProductName}"
+        "/DOutputDir=${ProjectRoot}\release"
+        "/DOutputName=${OutputName}-Installer"
+        "${ProjectRoot}\installer\${ProductName}.iss"
+    )
+    Invoke-External $Iscc @IsccArgs
+    Log-Group
 }
 
 Package

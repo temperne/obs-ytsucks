@@ -233,6 +233,10 @@ PiiMatcher::PiiMatcher(const MatcherConfig &config) : min_confidence_(config.min
 		// Tolerates the stray spaces OCR likes to put around '@' and '.'.
 		add(PiiKind::Email, R"([a-z0-9._%+-]+ ?@ ?[a-z0-9-]+(?: ?\. ?[a-z0-9-]+)*(?: ?\. ?[a-z]{2,}))", CI,
 		    false, Boundary::None, nullptr);
+		// OCR of small text garbles the domain ("name@emiail'eam"): any word
+		// with at least two characters on both sides of an '@' counts.
+		add(PiiKind::Email, R"([a-z0-9._%+-]{2,}@[a-z0-9][a-z0-9.,'_-]{2,})", CI, false, Boundary::None,
+		    nullptr);
 	}
 
 	if (config.phone) {
@@ -262,10 +266,14 @@ PiiMatcher::PiiMatcher(const MatcherConfig &config) : min_confidence_(config.min
 
 	if (config.street_address) {
 		add(PiiKind::StreetAddress,
-		    R"(\d{1,6}(?:\s+[a-z0-9.'-]+){1,5}?\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|way|place|pl|terrace|ter|circle|cir|highway|hwy|parkway|pkwy|square|sq|trail|trl|crescent|cres|alley|aly)\b\.?(?:,?\s*(?:apt|apartment|suite|ste|unit|#)\.?\s*[a-z0-9-]+)?)",
+		    R"(\d{1,6}(?:\s+[a-z0-9.'-]+){1,5}?\s+(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|way|place|pl|terrace|ter|circle|cir|highway|hwy|parkway|pkwy|square|sq|trail|trl|crescent|cres|alley|aly)\b\.?(?:,?\s*(?:apt|apartment|suite|ste|unit|#)\.?\s*#?\s*[a-z0-9-]+)?)",
 		    CI, false, Boundary::NoAdjacentAlnum, nullptr);
 		add(PiiKind::StreetAddress, R"(p\.?\s?o\.?\s+box\s+\d+)", CI, false, Boundary::NoAdjacentAlnum,
 		    nullptr);
+		// "Tucson, Arizona 85705" (full state name).
+		add(PiiKind::StreetAddress,
+		    R"([A-Z][A-Za-z.' -]{1,30},\s*(?:Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|Georgia|Hawaii|Idaho|Illinois|Indiana|Iowa|Kansas|Kentucky|Louisiana|Maine|Maryland|Massachusetts|Michigan|Minnesota|Mississippi|Missouri|Montana|Nebraska|Nevada|New Hampshire|New Jersey|New Mexico|New York|North Carolina|North Dakota|Ohio|Oklahoma|Oregon|Pennsylvania|Rhode Island|South Carolina|South Dakota|Tennessee|Texas|Utah|Vermont|Virginia|Washington|West Virginia|Wisconsin|Wyoming|District of Columbia)\s+\d{5}(?:-\d{4})?)",
+		    CS, false, Boundary::NoAdjacentAlnum, nullptr);
 		// "Springfield, IL 62704" / "Springfield, IL 62704-1234" (case sensitive on purpose).
 		add(PiiKind::StreetAddress, R"([A-Z][A-Za-z.' -]{1,30},\s*[A-Z]{2}\s+\d{5}(?:-\d{4})?)", CS, false,
 		    Boundary::NoAdjacentAlnum, nullptr);
@@ -365,7 +373,23 @@ std::vector<PiiMatcher::Span> PiiMatcher::match_text(const std::string &text) co
 		}
 	}
 
-	return spans;
+	// Drop duplicates and spans nested in another span of the same kind
+	// (several rules can match the same text).
+	std::sort(spans.begin(), spans.end(), [](const Span &a, const Span &b) {
+		if (a.start != b.start)
+			return a.start < b.start;
+		return a.end > b.end;
+	});
+	std::vector<Span> unique;
+	for (const Span &sp : spans) {
+		bool nested = false;
+		for (const Span &u : unique)
+			if (u.kind == sp.kind && u.start <= sp.start && sp.end <= u.end)
+				nested = true;
+		if (!nested)
+			unique.push_back(sp);
+	}
+	return unique;
 }
 
 std::vector<Detection> PiiMatcher::match(const std::vector<OcrLine> &lines) const

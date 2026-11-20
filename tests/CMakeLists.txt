@@ -7,9 +7,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(CORE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../src/core")
-add_library(pii-core STATIC
+add_library(
+  pii-core
+  STATIC
   "${CORE_DIR}/pii-matcher.cpp"
-  "${CORE_DIR}/region-tracker.cpp"
+  "${CORE_DIR}/motion-tracker.cpp"
+  "${CORE_DIR}/bands.cpp"
   "${CORE_DIR}/rect.cpp"
   "${CORE_DIR}/image.cpp"
 )

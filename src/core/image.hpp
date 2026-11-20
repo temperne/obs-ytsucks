@@ -37,10 +37,18 @@ struct Image {
 // Copy a (possibly padded) BGRA buffer into a packed Image.
 Image image_from_bgra(const uint8_t *data, uint32_t width, uint32_t height, uint32_t linesize);
 
+// Copy a (possibly padded) 8-bit single-channel buffer into a packed Image.
+Image image_from_grey(const uint8_t *data, uint32_t width, uint32_t height, uint32_t linesize);
+
 // Area-average resample to the given size (any channel count).
 Image resize(const Image &src, uint32_t width, uint32_t height);
 
 // BGRA -> 8-bit luma (BT.601).
 Image to_grey(const Image &bgra);
+
+// Make all text dark-on-light: every `tile` x `tile` block whose mean is
+// dark (a dark-mode window, a terminal...) is inverted in place. Lets OCR
+// skip its own "try the line inverted too" pass, which costs ~30-40%.
+void normalize_polarity(Image &grey, int tile = 48);
 
 } // namespace pii

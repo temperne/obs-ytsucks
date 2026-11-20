@@ -80,6 +80,12 @@ enum class PiiKind {
 
 const char *pii_kind_name(PiiKind kind);
 
+// Merge overlapping (or touching) rectangles until none overlap.
+std::vector<Rect> merge_rects(std::vector<Rect> rects);
+
+// Intersection-over-union of two rectangles (0 when disjoint).
+double iou(const Rect &a, const Rect &b);
+
 struct Detection {
 	PiiKind kind;
 	std::string text; // matched text (never logged by default)

@@ -54,10 +54,43 @@ or display capture), or to a nested scene to protect everything inside it.
 
 * **Redaction style.** *Solid box* is the default and the only safe choice.
   Pixelation and blur of short text such as numbers can sometimes be reversed.
-* **Padding / Keep redaction after text disappears.** These grow boxes and
-  keep them up for a while, which hides OCR jitter and scrolling.
-* **Minimum time between scans, OCR resolution scale.** Trade CPU for speed.
-  A scale of 0.5 is about 4× faster but misses small text.
+* **Paranoid mode (on by default).**
+  * *Keep everything covered until it has been checked:* the screen starts
+    covered by a "Protecting Personal Information" image. The cover
+    shrinks as full scans verify the screen. Anything that changes or
+    scrolls into view is covered again until it has been read, while
+    content that only scrolled stays visible.
+  * *Cover image:* replace the built-in image with your own picture.
+  * *Also cover the lines above and below detected PII:* a contact block
+    stays hidden even if OCR misreads the address next to the phone number
+    it did catch.
+* **Tracking.** Each detected item gets an anchor: its clearest,
+  highest-confidence word, kept as a full-resolution image. Every frame,
+  that word is found again in a search window stretched in the direction
+  of motion, and the box moves with it. Between full scans, targeted scans
+  re-read the area around each known box at full resolution.
+* **Box lifetime.** Once something is detected, its box stays up until
+  scans confirm the text is gone: two scans in a row must not see it, so
+  one OCR miss can't uncover it. *Extra time to keep a box* adds a margin
+  after that, and *Padding* grows each box.
+* **Scrolling.** The page's motion is measured per vertical strip of the
+  frame, a few times per second, so boxes move together with the content
+  between scans. Between measurements they are moved at the measured speed
+  and widened in the direction of motion. A scan only reads parts of the
+  frame with new content; content that just moved is not read again.
+* **While scrolling, cover the edge where new content comes in** (on by
+  default). Text scrolling into view can't be read until a scan reaches
+  it, so the strip it enters through is covered until then. The strip is
+  sized from the scroll speed and only appears while the page moves.
+* **OCR threads.** 0 picks about 3/4 of your CPU cores (at most 8). Lower
+  it if your encoder (x264) needs the CPU.
+* **Minimum time between scans, OCR resolution scale.** Scans run back to
+  back by default (0 ms). For small on-screen text (high-resolution display
+  captures), a scale above 1.0 helps Tesseract read it, at a CPU cost.
+* **Status line.** The top of the filter properties shows scan time,
+  latency, how much of the frame was re-read, tracked boxes and scroll
+  speed. Starting OBS with `OBS_PII_DEBUG=1` also writes this to the log for
+  every scan.
 * **Delay video by N frames (leak protection).** OCR takes time (tens of ms
   with Apple Vision or Windows OCR, 100 ms to 1 s+ with Tesseract), so newly
   shown text is visible until the first scan finds it. With a delay, the

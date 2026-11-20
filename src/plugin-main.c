@@ -21,6 +21,8 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include "pii-redact-filter.h"
 
+#include <stdlib.h>
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
@@ -32,6 +34,11 @@ MODULE_EXPORT const char *obs_module_description(void)
 
 bool obs_module_load(void)
 {
+#ifndef _WIN32
+	// We run one Tesseract instance per OCR thread; stop each of them from
+	// also spawning OpenMP threads (massive oversubscription otherwise).
+	setenv("OMP_THREAD_LIMIT", "1", 0);
+#endif
 	register_pii_redact_filter();
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;

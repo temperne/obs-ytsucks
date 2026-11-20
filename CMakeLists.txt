@@ -35,6 +35,8 @@ include(helpers)
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
 find_package(libobs REQUIRED)
+find_package(Threads REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Threads::Threads)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
 if(ENABLE_FRONTEND_API)
@@ -67,10 +69,14 @@ target_sources(
     src/core/pii-matcher.hpp
     src/core/pii-types.hpp
     src/core/rect.cpp
-    src/core/region-tracker.cpp
-    src/core/region-tracker.hpp
+    src/core/bands.cpp
+    src/core/bands.hpp
+    src/core/motion-tracker.cpp
+    src/core/motion-tracker.hpp
     src/ocr/ocr-engine.hpp
     src/ocr/ocr-factory.cpp
+    src/ocr/ocr-pool.cpp
+    src/ocr/ocr-pool.hpp
 )
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE src)
 
@@ -94,9 +100,7 @@ if(ENABLE_TESSERACT)
     if(NOT EXISTS "${_tessdata}")
       message(STATUS "Downloading eng.traineddata (tessdata_fast)...")
       file(
-        DOWNLOAD
-        "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata"
-        "${_tessdata}"
+        DOWNLOAD "https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata" "${_tessdata}"
         SHOW_PROGRESS
         STATUS _dl_status
       )
@@ -121,8 +125,10 @@ elseif(ENABLE_NATIVE_OCR AND APPLE)
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE PII_HAVE_APPLE_VISION)
   target_link_libraries(
     ${CMAKE_PROJECT_NAME}
-    PRIVATE "$<LINK_LIBRARY:FRAMEWORK,Vision.framework>" "$<LINK_LIBRARY:FRAMEWORK,CoreGraphics.framework>"
-            "$<LINK_LIBRARY:FRAMEWORK,Foundation.framework>"
+    PRIVATE
+      "$<LINK_LIBRARY:FRAMEWORK,Vision.framework>"
+      "$<LINK_LIBRARY:FRAMEWORK,CoreGraphics.framework>"
+      "$<LINK_LIBRARY:FRAMEWORK,Foundation.framework>"
   )
   set(_have_ocr ON)
 endif()
