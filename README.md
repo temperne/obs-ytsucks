@@ -98,7 +98,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build
 ```
 
-Install for the current user (OBS 30+ loads plugins from `~/.config/obs-studio/plugins`):
+Or build and install for the current user in one step with `scripts/install-linux-user.sh` (use `--flatpak` for Flatpak OBS). To do it by hand (OBS 30+ loads per-user plugins from `~/.config/obs-studio/plugins`):
 
 ```bash
 P=~/.config/obs-studio/plugins/obs-ytsucks && mkdir -p "$P/bin/64bit" "$P/data" && cp build/obs-ytsucks.so "$P/bin/64bit/" && cp -r data/* "$P/data/"

@@ -31,3 +31,4 @@
 # Allow tests and docs
 !/tests
 !/docs
+!/scripts
