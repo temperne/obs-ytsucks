@@ -233,6 +233,10 @@ PiiMatcher::PiiMatcher(const MatcherConfig &config) : min_confidence_(config.min
 		// Tolerates the stray spaces OCR likes to put around '@' and '.'.
 		add(PiiKind::Email, R"([a-z0-9._%+-]+ ?@ ?[a-z0-9-]+(?: ?\. ?[a-z0-9-]+)*(?: ?\. ?[a-z]{2,}))", CI,
 		    false, Boundary::None, nullptr);
+		// OCR of small text garbles the domain ("name@emiail'eam"): any word
+		// with at least two characters on both sides of an '@' counts.
+		add(PiiKind::Email, R"([a-z0-9._%+-]{2,}@[a-z0-9][a-z0-9.,'_-]{2,})", CI, false, Boundary::None,
+		    nullptr);
 	}
 
 	if (config.phone) {
@@ -369,7 +373,23 @@ std::vector<PiiMatcher::Span> PiiMatcher::match_text(const std::string &text) co
 		}
 	}
 
-	return spans;
+	// Drop duplicates and spans nested in another span of the same kind
+	// (several rules can match the same text).
+	std::sort(spans.begin(), spans.end(), [](const Span &a, const Span &b) {
+		if (a.start != b.start)
+			return a.start < b.start;
+		return a.end > b.end;
+	});
+	std::vector<Span> unique;
+	for (const Span &sp : spans) {
+		bool nested = false;
+		for (const Span &u : unique)
+			if (u.kind == sp.kind && u.start <= sp.start && sp.end <= u.end)
+				nested = true;
+		if (!nested)
+			unique.push_back(sp);
+	}
+	return unique;
 }
 
 std::vector<Detection> PiiMatcher::match(const std::vector<OcrLine> &lines) const

@@ -347,7 +347,9 @@ void MotionTracker::measure_strips(const Frame &prev, Frame &cur)
 		}
 
 		const int pred = static_cast<int>(std::lround(strip_vy_[k] * gap * sy_));
-		const int radius = std::min(H / 3, std::max(12, std::abs(pred) / 2 + 8 * static_cast<int>(gap)));
+		// Scroll-wheel jumps can move content 50+ px per frame, so search
+		// (almost) the whole range; the 1-D profile match makes this cheap.
+		const int radius = H / 2 + std::abs(pred);
 
 		auto profile_cost = [&](int sh) {
 			double sum = 0;

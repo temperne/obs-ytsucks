@@ -25,6 +25,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include "image.hpp"
 #include "pii-types.hpp"
 
+#include <utility>
 #include <vector>
 
 namespace pii {
@@ -61,5 +62,12 @@ int estimate_vertical_shift(const Image &prev, const Image &cur, int max_shift, 
 // such rows. Returns a large value on size mismatch.
 double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, int shift, double &new_fraction,
 			 int x0 = 0, int x1 = -1);
+
+// Split rows [y0, y1) of a grey image into horizontal segments at window
+// borders (a vertical edge running through most of the rows) and at blank
+// vertical gaps at least `min_gap` px wide. OCR'ing each segment separately
+// stops text from side-by-side windows being glued into one "line".
+// Returns [x0, x1) ranges; blank segments are dropped.
+std::vector<std::pair<int, int>> split_columns(const Image &grey, int y0, int y1, int min_gap = 16, int min_width = 24);
 
 } // namespace pii

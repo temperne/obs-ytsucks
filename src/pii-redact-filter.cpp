@@ -109,8 +109,8 @@ constexpr const char *S_STATUS = "status";
 constexpr int kMaxDelayFrames = 120;
 constexpr uint32_t kThumbWidth = 768;
 // Motion sampling: every Nth frame while static, every Mth while moving.
-constexpr uint64_t kSampleEveryStatic = 6;
-constexpr uint64_t kSampleEveryMoving = 2;
+constexpr uint64_t kSampleEveryStatic = 3;
+constexpr uint64_t kSampleEveryMoving = 1;
 constexpr size_t kThumbStages = 3;
 
 // Physical CPU cores (hyper-threads don't help OCR much).
@@ -513,7 +513,8 @@ void PiiRedactFilter::worker_main()
 		// offset (or unshifted) keeps the previous detections, moved by that
 		// offset. Only bands with new content are OCR'd, which while
 		// scrolling is essentially the strip that just came into view.
-		Image sig = to_grey(img);
+		const Image grey_full = to_grey(img);
+		Image sig = grey_full;
 		sig = resize(sig, std::max<uint32_t>(1, sig.width / 4), std::max<uint32_t>(1, sig.height / 4));
 		const double sig_to_img = static_cast<double>(ih) / sig.height;
 		const bool have_prev = prev_valid && prev_sig.width == sig.width && prev_sig.height == sig.height;
@@ -537,6 +538,7 @@ void PiiRedactFilter::worker_main()
 		crops.reserve(bands.size());
 		std::vector<const Image *> todo;
 		std::vector<int> todo_y;
+		std::vector<int> todo_x;
 		const int sh = static_cast<int>(sig.height);
 		std::vector<uint8_t> verified(static_cast<size_t>(sh), 0);
 		const int edge_rows = static_cast<int>(std::ceil(overlap / sig_to_img));
@@ -590,8 +592,13 @@ void PiiRedactFilter::worker_main()
 				}
 				continue;
 			}
-			crops.push_back(crop(img, Rect{0, b.y, static_cast<int>(img.width), b.h}));
-			todo_y.push_back(b.y);
+			// Read each window / text column of the band on its own, so text
+			// from side-by-side windows is never glued into one line.
+			for (const auto &seg : split_columns(grey_full, b.y, b.y + b.h)) {
+				crops.push_back(crop(img, Rect{seg.first, b.y, seg.second - seg.first, b.h}));
+				todo_x.push_back(seg.first);
+				todo_y.push_back(b.y);
+			}
 			// Rows this OCR pass reads with full context: the band minus half
 			// the overlap at internal edges (the neighbour covers those) and
 			// minus a full line height at the frame's top/bottom edge, where
@@ -612,8 +619,10 @@ void PiiRedactFilter::worker_main()
 		for (size_t k = 0; k < results.size(); k++) {
 			std::vector<OcrLine> lines = results[k];
 			for (OcrLine &l : lines) {
-				for (OcrWord &w : l.words)
+				for (OcrWord &w : l.words) {
+					w.box.x += todo_x[k];
 					w.box.y += todo_y[k];
+				}
 				words += l.words.size();
 			}
 			for (const Detection &d : matcher->match(lines))

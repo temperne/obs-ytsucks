@@ -80,6 +80,9 @@ static void test_detectors()
 
 	CHECK(has_kind(m, "contact john.doe@example.com today", PiiKind::Email));
 	CHECK(has_kind(m, "mail: jane_d @ mail.example.co.uk", PiiKind::Email));
+	CHECK(has_kind(m, "jasonatensen@emiail'eam", PiiKind::Email));
+	CHECK(has_kind(m, "dasonajensen@emailicom", PiiKind::Email));
+	CHECK(!has_kind(m, "follow @someone", PiiKind::Email));
 	CHECK(has_kind(m, "Call (555) 123-4567 now", PiiKind::Phone));
 	CHECK(has_kind(m, "Call 555.123.4567", PiiKind::Phone));
 	CHECK(has_kind(m, "+1 555 123 4567", PiiKind::Phone));
@@ -306,6 +309,31 @@ static void test_bands()
 	CHECK(plan_bands(200, 8, 40, 150).size() == 1);
 	CHECK(plan_bands(0, 4, 10, 10).empty());
 
+	{
+		// Two "windows": white with text-like noise | border | dark with noise,
+		// plus a wide blank gap inside the white window.
+		Image g;
+		g.width = 200;
+		g.height = 40;
+		g.channels = 1;
+		g.pixels.assign(200 * 40, 255);
+		for (int y = 0; y < 40; y++)
+			for (int x = 0; x < 200; x++) {
+				uint8_t &p = g.pixels[static_cast<size_t>(y * 200 + x)];
+				if (x >= 120)
+					p = 30;
+				const bool ink = ((x * 7 + y * 13) % 5) == 0;
+				if (ink && ((x >= 10 && x < 50) || (x >= 80 && x < 115) || (x >= 130 && x < 190)))
+					p = x >= 120 ? 220 : 0;
+			}
+		auto segs = split_columns(g, 0, 40);
+		CHECK(segs.size() == 3);
+		if (segs.size() == 3) {
+			CHECK(segs[0].first <= 10 && segs[0].second >= 50 && segs[0].second < 80);
+			CHECK(segs[1].first > 50 && segs[1].first <= 80 && segs[1].second <= 124);
+			CHECK(segs[2].first >= 116 && segs[2].second >= 190);
+		}
+	}
 	Image img = page_frame(64, 32, 0);
 	Image c = crop(img, Rect{10, 5, 20, 8});
 	CHECK(c.width == 20 && c.height == 8 && c.pixels[0] == img.pixels[5 * 64 + 10]);

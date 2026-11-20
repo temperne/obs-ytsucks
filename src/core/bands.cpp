@@ -179,4 +179,75 @@ double shifted_band_diff(const Image &prev, const Image &cur, int y0, int y1, in
 	return n ? static_cast<double>(sum) / static_cast<double>(n) : 1e9;
 }
 
+std::vector<std::pair<int, int>> split_columns(const Image &grey, int y0, int y1, int min_gap, int min_width)
+{
+	std::vector<std::pair<int, int>> out;
+	const int w = static_cast<int>(grey.width);
+	y0 = std::max(0, y0);
+	y1 = std::min(static_cast<int>(grey.height), y1);
+	if (grey.channels != 1 || w <= 0 || y1 <= y0)
+		return out;
+	const int h = y1 - y0;
+
+	// Per column: value range (blank if tiny) and how many rows have a strong
+	// step to the previous column (a window border runs through most rows).
+	std::vector<uint8_t> lo(static_cast<size_t>(w), 255), hi(static_cast<size_t>(w), 0);
+	std::vector<int> steps(static_cast<size_t>(w), 0);
+	for (int y = y0; y < y1; y++) {
+		const uint8_t *row = grey.pixels.data() + static_cast<size_t>(y) * grey.width;
+		for (int x = 0; x < w; x++) {
+			const uint8_t v = row[x];
+			lo[static_cast<size_t>(x)] = std::min(lo[static_cast<size_t>(x)], v);
+			hi[static_cast<size_t>(x)] = std::max(hi[static_cast<size_t>(x)], v);
+			if (x > 0 && std::abs(static_cast<int>(v) - static_cast<int>(row[x - 1])) > 40)
+				steps[static_cast<size_t>(x)]++;
+		}
+	}
+	auto blank = [&](int x) {
+		return hi[static_cast<size_t>(x)] - lo[static_cast<size_t>(x)] < 16;
+	};
+	auto border = [&](int x) {
+		return steps[static_cast<size_t>(x)] * 10 >= h * 8;
+	};
+
+	// Cut at borders and at blank runs of at least min_gap columns.
+	std::vector<int> cuts = {0};
+	int run = 0;
+	for (int x = 0; x < w; x++) {
+		if (border(x)) {
+			cuts.push_back(x);
+			run = 0;
+			continue;
+		}
+		if (blank(x)) {
+			run++;
+			if (run == min_gap)
+				cuts.push_back(x - min_gap / 2);
+		} else {
+			run = 0;
+		}
+	}
+	cuts.push_back(w);
+	std::sort(cuts.begin(), cuts.end());
+
+	for (size_t i = 0; i + 1 < cuts.size(); i++) {
+		int a = cuts[i], b = cuts[i + 1];
+		// Trim blank columns at both ends.
+		while (a < b && blank(a))
+			a++;
+		while (b > a && blank(b - 1))
+			b--;
+		if (b - a < min_width)
+			continue;
+		// Small margin so glyphs touching the cut are not clipped.
+		a = std::max(0, a - 4);
+		b = std::min(w, b + 4);
+		if (!out.empty() && a < out.back().second)
+			a = out.back().second;
+		if (b > a)
+			out.emplace_back(a, b);
+	}
+	return out;
+}
+
 } // namespace pii
